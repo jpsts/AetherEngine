@@ -604,12 +604,22 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private static let loggedRetries = 3
     private static let retryLogStride = 10
 
-    /// The live refresh, retried steadily while the origin refuses it or cannot be reached. A media
-    /// playlist that answers as gone (a 4xx other than 429: an IPTV panel's session URL that expired
-    /// or was revoked) is asked for again through the URL the host loaded, once, when that URL led to
-    /// it (`canReresolve`), for a fresh session URL; the playlist tracker follows MEDIA-SEQUENCE, so
-    /// the segments it hands out continue where they left off. Parse errors throw at once. Returns the
-    /// playlist and the URL it was read from, which later refreshes use.
+    /// Refusals of a session URL after which it is asked for again through the URL the host loaded.
+    /// An IPTV panel that let another device's connection take the account's last slot keeps refusing
+    /// the session it evicted, while a fresh session from the loaded URL is admitted at once (the field
+    /// log behind this: two refusal windows of 18 and 27 s on the evicted session URL, each ended by a
+    /// host reload whose fresh session was served within 0.3 s). Two lets a refusal that lifts by itself
+    /// within a second or two keep the session it has.
+    static let sessionURLRefusalsBeforeReresolve = 2
+
+    /// The live refresh, retried steadily while the origin refuses it or cannot be reached. When the
+    /// URL the host loaded led to this media playlist through redirects (`canReresolve`: an IPTV
+    /// panel's tokenized session URL), a playlist that answers as gone (a 4xx other than 429 and 408:
+    /// the session expired or was revoked) is asked for again through the loaded URL at once, and one
+    /// refused `sessionURLRefusalsBeforeReresolve` times in a row after that, for a fresh session URL;
+    /// the loaded URL is then asked at the same steady pace. The playlist tracker follows
+    /// MEDIA-SEQUENCE, so the segments it hands out continue where they left off. Parse errors throw at
+    /// once. Returns the playlist and the URL it was read from, which later refreshes use.
     private func refreshMediaPlaylist(_ mediaURL: URL, canReresolve: Bool) async throws -> (HLSMediaPlaylist, URL) {
         let startedAt = Date()
         let deadline = startedAt.addingTimeInterval(Self.refreshRetryBudget)
@@ -644,14 +654,33 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 }
                 failures += 1
                 try await waitBeforeRetrying(error, failures: failures, deadline: deadline)
+                url = Self.nextRefreshURL(after: failures, current: url, sessionURL: mediaURL,
+                                          loadedURL: playlistURL, canReresolve: canReresolve)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 if (error as? URLError)?.code == .cancelled { throw error }
                 failures += 1
                 try await waitBeforeRetrying(error, failures: failures, deadline: deadline)
+                url = Self.nextRefreshURL(after: failures, current: url, sessionURL: mediaURL,
+                                          loadedURL: playlistURL, canReresolve: canReresolve)
             }
         }
+    }
+
+    /// Where the next refresh goes after `failures` in a row: the loaded URL, for a fresh session,
+    /// once the session URL has been refused `sessionURLRefusalsBeforeReresolve` times; otherwise
+    /// where the last one went.
+    static func nextRefreshURL(after failures: Int, current: URL, sessionURL: URL, loadedURL: URL,
+                               canReresolve: Bool) -> URL {
+        guard canReresolve, current == sessionURL, failures >= sessionURLRefusalsBeforeReresolve else {
+            return current
+        }
+        EngineLog.emit(
+            "[HLSIngest] session URL refused \(failures) times; asking the loaded URL for a fresh one",
+            category: .engine
+        )
+        return loadedURL
     }
 
     /// A status that says the playlist will not be served at this URL again, rather than not now:

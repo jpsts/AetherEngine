@@ -22,10 +22,13 @@ the public-API contract.
   unreachable refresh (429, 5xx, transport) is now asked again every second, or after the origin's
   Retry-After up to 5 s, for up to 60 s, and so is a refused segment; the live ingest's refusals no
   longer arm the pacer or lower the origin's request budget. `LiveRefusalRecoveryTests`.
-- **A revoked session URL is asked for again through the loaded URL.** A media playlist reached
-  through redirects (an IPTV panel's tokenized session URL) that answers a 4xx other than 429 or 408
-  is resolved again, once, through the URL the host loaded; the tracker follows MEDIA-SEQUENCE, so
-  the segments continue where they left off. A source without a separate session URL still ends there.
+- **A refused or revoked session URL is asked for again through the loaded URL.** A media playlist
+  reached through redirects (an IPTV panel's tokenized session URL) that answers a 4xx other than 429
+  or 408 is resolved again through the URL the host loaded at once, and one refused twice in a row
+  after that: in the field log, a panel kept refusing the session it evicted (509 for 18 and 27 s)
+  while a fresh session from the loaded URL was served within 0.3 s. The tracker follows
+  MEDIA-SEQUENCE, so the segments continue where they left off. A source without a separate session
+  URL still ends on a gone playlist.
 - **A live join the origin refuses is reported as its answer.** The ingest's refused or unreachable
   playlist reached the host as `customSourceProbeFailed`, which reads as a stream the engine cannot
   read, and a host that falls back on that moves the channel to another route. It is now

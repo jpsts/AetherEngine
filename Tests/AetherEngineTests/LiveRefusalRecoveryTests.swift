@@ -231,6 +231,44 @@ struct LiveRefusalRecoveryTests {
         #expect(!OriginRequestBudget.shared.isPaced(url))
     }
 
+    @Test("a session URL that stays refused is asked for again through the loaded URL")
+    func refusedSessionURLIsResolvedAfresh() async throws {
+        // The loaded URL redirects to a session URL, as an IPTV panel's does. Once another device
+        // has taken the account's last slot, the panel goes on refusing the session it evicted with
+        // 509, while a fresh session from the loaded URL is admitted at once.
+        let origin = try #require(ScriptedOrigin { path, index in
+            switch path {
+            case "/live/1.m3u8":
+                return .init(status: 302, headers: ["Location": "/hls/session\(index + 1)/media.m3u8"])
+            case "/hls/session1/media.m3u8":
+                return index == 0
+                    ? .init(status: 200, body: Self.playlist(count: 8, endList: false))
+                    : .init(status: 509)
+            case "/hls/session2/media.m3u8":
+                return .init(status: 200, body: Self.playlist(count: 16, endList: true))
+            default:
+                if let segment = Self.segmentIndex(path) { return .init(status: 200, body: Self.segment(segment)) }
+                return .init(status: 404)
+            }
+        })
+        defer { origin.stop() }
+
+        let url = origin.url("/live/1.m3u8")
+        let reader = HLSLiveIngestReader(playlistURL: url)
+        defer { reader.close() }
+
+        let expected = (1..<16).map(Self.segment).reduce(Data(), +)
+        let got = try await drain(reader, expectedBytes: expected.count)
+
+        #expect(reader.terminalError == nil)
+        #expect(got == expected)
+        #expect(origin.requestCount("/hls/session1/media.m3u8")
+                == 1 + HLSLiveIngestReader.sessionURLRefusalsBeforeReresolve)
+        #expect(origin.requestCount("/live/1.m3u8") == 2)
+        #expect(origin.requestCount("/hls/session2/seg15.ts") == 1)
+        #expect(!OriginRequestBudget.shared.isPaced(url))
+    }
+
     @Test("a revoked session URL is asked for again through the loaded URL")
     func revokedSessionURLIsResolvedAfresh() async throws {
         // The loaded URL redirects to a session URL, as an IPTV panel's does. The first session's
@@ -328,5 +366,19 @@ struct LiveRefusalRecoveryTests {
         #expect(!HLSLiveIngestReader.isGoneStatus(408))
         #expect(!HLSLiveIngestReader.isGoneStatus(509))
         #expect(!HLSLiveIngestReader.isGoneStatus(503))
+    }
+
+    @Test("a refused session URL gives way to the loaded URL after two refusals, and only a session URL does")
+    func refreshURLChoice() {
+        let session = URL(string: "http://127.0.0.1:1/hls/s1/media.m3u8")!
+        let loaded = URL(string: "http://127.0.0.1:1/live/1.m3u8")!
+        func next(_ failures: Int, from current: URL, canReresolve: Bool = true) -> URL {
+            HLSLiveIngestReader.nextRefreshURL(after: failures, current: current, sessionURL: session,
+                                               loadedURL: loaded, canReresolve: canReresolve)
+        }
+        #expect(next(1, from: session) == session)
+        #expect(next(2, from: session) == loaded)
+        #expect(next(5, from: loaded) == loaded)
+        #expect(next(9, from: session, canReresolve: false) == session)
     }
 }
