@@ -10,6 +10,28 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed (jpsts/AetherEngine, Spectrum's fork of 7.36.0)
+
+- **A live HLS source refused for a while keeps its session.** A connection-limited IPTV panel answers
+  a live playlist refresh with 509 while another device on the account holds its last slot, which
+  lasts seconds to tens of seconds while that device changes channels, and serves again the moment
+  the slot is free. The ingest retried 1, 2 and 4 s apart and went terminal at 12 s, which on the
+  software path ended the session; and each refusal armed the origin's request pacer (a quiet of up
+  to 15 s), so the reload or reopen after it waited up to 10 s for its first request. In the field log
+  this was reported from, a 1080i channel was black for 15.5 s, 10 of them in the pacer. A refused or
+  unreachable refresh (429, 5xx, transport) is now asked again every second, or after the origin's
+  Retry-After up to 5 s, for up to 60 s, and so is a refused segment; the live ingest's refusals no
+  longer arm the pacer or lower the origin's request budget. `LiveRefusalRecoveryTests`.
+- **A revoked session URL is asked for again through the loaded URL.** A media playlist reached
+  through redirects (an IPTV panel's tokenized session URL) that answers a 4xx other than 429 or 408
+  is resolved again, once, through the URL the host loaded; the tracker follows MEDIA-SEQUENCE, so
+  the segments continue where they left off. A source without a separate session URL still ends there.
+- **A live join the origin refuses is reported as its answer.** The ingest's refused or unreachable
+  playlist reached the host as `customSourceProbeFailed`, which reads as a stream the engine cannot
+  read, and a host that falls back on that moves the channel to another route. It is now
+  `sourceRateLimited` (429/503/509) or `sourceRefused` with the status in `underlyingCode`, or
+  `liveSourceUnavailable` when nothing answered.
+
 ## [7.36.0] - 2026-10-13
 
 ### Added
