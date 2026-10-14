@@ -34,6 +34,15 @@ the public-API contract.
   read, and a host that falls back on that moves the channel to another route. It is now
   `sourceRateLimited` (429/503/509) or `sourceRefused` with the status in `underlyingCode`, or
   `liveSourceUnavailable` when nothing answered.
+- **A live channel AirPlays.** The live HLS ingest hands the pipeline a forward-only custom source, and
+  the wireless-AirPlay route change rebuilt the session to serve it on the device's LAN address. That
+  rebuild is refused for such a source (#526), and the refusal was dropped, so the receiver stayed on
+  127.0.0.1, which it cannot reach: it played nothing while the sender reported external playback. The
+  route change now swaps the player's item onto the receiver's address (and back onto the loopback when
+  the receiver lets go), as a sequential origin already did. The session, its ingest and its segment
+  cache carry on, so the source is not asked for anything again. The swapped item rejoins its live
+  playlist the way a live reload does, at the player's join point
+  (`AirPlayPlaylistDecision.routeChangeHop`).
 
 ## [7.36.0] - 2026-10-13
 
