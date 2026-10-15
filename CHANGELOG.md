@@ -12,6 +12,29 @@ the public-API contract.
 
 ### Fixed (jpsts/AetherEngine, Spectrum's fork of 7.36.0)
 
+- **A live stream read off its URL and refused for a while keeps its session.** The continuous
+  MPEG-TS form of an IPTV channel is one connection for as long as it plays, and a connection-limited
+  panel answers its reconnects with 509 while another device on the account holds the last slot,
+  for seconds to tens of seconds. The reader climbed its 0.5, 1, 2, 4, 8 s ladder, gave up after six
+  refusals, and each refusal armed the origin's request pacer (a quiet of up to 15 s, with each
+  request waiting up to 10 s on it), which the reload after it then waited out. A live stream's
+  429/503/509 is now asked again every second, or after the origin's Retry-After up to 5 s, for up to
+  60 s, the way the live HLS ingest asks for its playlist; its refusals arm no pacer and lower no
+  budget, and the books still say the origin refused, so the revive arm tells metered from lost. A
+  live open the origin answers with a status fails typed with that status at once
+  (`AVIOReaderError.httpStatus`, `sourceRateLimited` or `sourceRefused` at the host), where the read
+  loop used to spend the open budget on the same request and hand back an untyped read failure.
+  `LiveStreamRefusalRetryTests`.
+- **A live stream on the software path starts near the newest media.** A continuous live stream over
+  HTTP opens with a burst of what the origin holds of the channel (8 to 18 s on one IPTV panel, at
+  link speed), and the software host armed its clock on that burst's first packet. Nothing on the
+  software path catches up, so the picture then ran the whole burst behind the broadcast for as long
+  as the channel played: measured 17 s behind on a channel whose native-path session ran 6 s behind.
+  The live feeder now waits for the burst to land (the ring growing no faster than real time over a
+  quarter second, from 0.3 s on, or 1.5 s at most) and starts 4 s behind the newest media, on a
+  keyframe; a source that delivers in real time, or a ring too shallow to be worth a later keyframe,
+  still starts from its first packet. The media behind the start stays in the rewind ring.
+  `SoftwareLiveJoinPolicy`, `SoftwareLiveJoinPlacementTests`.
 - **A live HLS source refused for a while keeps its session.** A connection-limited IPTV panel answers
   a live playlist refresh with 509 while another device on the account holds its last slot, which
   lasts seconds to tens of seconds while that device changes channels, and serves again the moment

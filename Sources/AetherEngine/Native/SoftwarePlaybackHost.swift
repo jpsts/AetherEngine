@@ -328,6 +328,9 @@ final class SoftwarePlaybackHost {
     nonisolated(unsafe) private var sessionStartPts: Double = .nan
 
     nonisolated(unsafe) private var newestSourcePts: Double = .nan
+    /// Where a live session's picture starts once the source's connect burst has landed; read and
+    /// advanced by the live feeder under `liveEdgeLock`, reset with the session.
+    nonisolated(unsafe) private var liveJoinPolicy = SoftwareLiveJoinPolicy()
 
     /// Guards `sessionStartPts` / `newestSourcePts` against the demux
     /// thread writing while the main-actor time tick reads them.
@@ -1857,6 +1860,7 @@ final class SoftwarePlaybackHost {
         retentionClaims.removeAll()
         liveEdgeLock.lock()
         sessionStartPts = .nan
+        liveJoinPolicy = SoftwareLiveJoinPolicy()
         newestSourcePts = .nan
         liveEdgeLock.unlock()
 
@@ -2019,6 +2023,20 @@ final class SoftwarePlaybackHost {
             let recoverCursor: @Sendable (Int) -> Void = { [weak self] old in
                 self?.recoverEvictedFeedCursor(from: old, ring: ring)
             }
+            // Where the live join starts, once the connect burst has landed (see the policy). Nil
+            // while it is still landing; the feeder asks again a moment later.
+            let liveJoinPlacement: @Sendable () -> SoftwareLiveJoinPolicy.Decision? = { [weak self] in
+                guard let self else { return .fromStart }
+                self.liveEdgeLock.lock()
+                defer { self.liveEdgeLock.unlock() }
+                guard self.sessionStartPts.isFinite, self.newestSourcePts.isFinite else { return nil }
+                return self.liveJoinPolicy.observe(firstPts: self.sessionStartPts,
+                                                   newestPts: self.newestSourcePts,
+                                                   at: ProcessInfo.processInfo.systemUptime)
+            }
+            let placeCursor: @Sendable (Int) -> Void = { [weak self] seq in
+                self?.setFeedCursor(seq)
+            }
             let setSourceEnded: @Sendable () -> Void = { [weak self] in
                 self?.sourceEnded = true
             }
@@ -2067,6 +2085,8 @@ final class SoftwarePlaybackHost {
                     readCursor: readCursor,
                     advanceCursor: advanceCursor,
                     recoverCursor: recoverCursor,
+                    liveJoinPlacement: liveJoinPlacement,
+                    placeCursor: placeCursor,
                     seekGeneration: getSeekGeneration,
                     currentRate: currentRate,
                     isPlaying: getFeederPlaying,
@@ -2341,6 +2361,8 @@ final class SoftwarePlaybackHost {
         readCursor: @Sendable () -> Int,
         advanceCursor: @Sendable (Int) -> Void,
         recoverCursor: @Sendable (Int) -> Void,
+        liveJoinPlacement: @Sendable () -> SoftwareLiveJoinPolicy.Decision? = { .fromStart },
+        placeCursor: @Sendable (Int) -> Void = { _ in },
         seekGeneration: @Sendable () -> UInt64,
         currentRate: @Sendable () -> Float,
         isPlaying: @Sendable () -> Bool,
@@ -2352,6 +2374,9 @@ final class SoftwarePlaybackHost {
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
         noteDecodeGeneration: @Sendable () -> Void
     ) {
+        // The join's start is placed once, before the first packet is fed; a seek before then is
+        // the viewer's own choice of position and retires it.
+        var liveJoinPending = true
         // Audio look-ahead pump (#107 audio chopping): feed audio packets ahead of the
         // combined cursor so the audio renderer holds AudioLookaheadPolicy.targetLeadSeconds
         // of decoded audio regardless of video decode pace. Without it audio lead is capped
@@ -2489,6 +2514,40 @@ final class SoftwarePlaybackHost {
                 preArmPacketsFed = 0
                 hadLead = false
                 rebuffering = false
+                liveJoinPending = false
+            }
+            if liveJoinPending {
+                switch liveJoinPlacement() {
+                case nil:
+                    if sourceEnded() {
+                        // Nothing more will land; play what there is from its start.
+                        liveJoinPending = false
+                    } else {
+                        condition.lock()
+                        autoreleasepool {
+                            _ = condition.wait(until: Date(timeIntervalSinceNow: 0.05))
+                        }
+                        condition.unlock()
+                        return true
+                    }
+                case .fromStart?:
+                    liveJoinPending = false
+                case .place(let targetPts)?:
+                    liveJoinPending = false
+                    let cursor = readCursor()
+                    if let seq = ring.seq(forKeyframeAtOrBefore: targetPts), seq > cursor,
+                       let keyframe = ring.packet(atSeq: seq) {
+                        let skipped = keyframe.pts - (ring.packet(atSeq: cursor)?.pts ?? keyframe.pts)
+                        EngineLog.emit(
+                            "[SWHost] live join placed \(String(format: "%.1f", SoftwareLiveJoinPolicy.leadSeconds))s "
+                            + "behind the newest media: skipped \(String(format: "%.1f", skipped))s of the "
+                            + "connect burst (cursor seq=\(cursor) -> \(seq), keyframe pts=\(String(format: "%.2f", keyframe.pts)))",
+                            category: .swPlayback
+                        )
+                        placeCursor(seq)
+                        return true
+                    }
+                }
             }
             let cursor = readCursor()
             let bounds = ring.seqBounds
