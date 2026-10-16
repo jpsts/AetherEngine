@@ -4,9 +4,13 @@ import Foundation
 
 /// A live stream read straight off its URL (an IPTV panel's continuous MPEG-TS form of a channel)
 /// and refused for a while, as a connection-limited panel refuses an account's requests with 509
-/// while another device holds its last slot, keeps its session: the reader asks again every second
-/// and carries on the moment it is served, the refusals arm no pacer, and a refused open is the
-/// origin's answer, typed, rather than a minute of the same request.
+/// while another device holds its last slot, keeps its session: the reader asks again on a short,
+/// steady wait until it is served, the refusals arm no pacer, and a refused open is the origin's
+/// answer, typed, rather than a minute of the same request.
+///
+/// The loopback cases run with the reconnect backoff scaled down, the way the other reader suites
+/// do, and are judged by what came through and how many requests it took, never by the wall clock.
+/// The wait itself is a pure rule, tested as one.
 @Suite("Live stream reader rides out refusals", .offCooperativePool, .timeLimit(.minutes(2)))
 struct LiveStreamRefusalRetryTests {
 
@@ -24,7 +28,7 @@ struct LiveStreamRefusalRetryTests {
         private let listener: LoopbackListener
         private let respond: @Sendable (_ index: Int) -> Response
         private let lock = NSLock()
-        private var times: [Date] = []
+        private var count = 0
 
         /// `respond` gets how many requests came before this one.
         init?(respond: @escaping @Sendable (_ index: Int) -> Response) {
@@ -45,8 +49,8 @@ struct LiveStreamRefusalRetryTests {
             listener.stop()
         }
 
-        var requestTimes: [Date] {
-            lock.withLock { times }
+        var requestCount: Int {
+            lock.withLock { count }
         }
 
         var url: URL {
@@ -64,8 +68,8 @@ struct LiveStreamRefusalRetryTests {
                 if request.count > 64 * 1024 { return }
             }
             let index: Int = lock.withLock {
-                times.append(Date())
-                return times.count - 1
+                count += 1
+                return count - 1
             }
             let response = respond(index)
             var header = "HTTP/1.1 \(response.status) \(response.status == 200 ? "OK" : "Status")\r\n"
@@ -115,20 +119,30 @@ struct LiveStreamRefusalRetryTests {
         return (total, nil)
     }
 
-    private static func gaps(_ times: [Date]) -> [TimeInterval] {
-        zip(times, times.dropFirst()).map { $1.timeIntervalSince($0) }
+    // MARK: - The wait
+
+    @Test("the wait is a second, or the origin's Retry-After up to five seconds")
+    func waitIsASecondOrTheRetryAfterUpToFive() {
+        #expect(AVIOReader.liveRefusalWait(retryAfter: 0) == 1)
+        #expect(AVIOReader.liveRefusalWait(retryAfter: 0.3) == 1)
+        #expect(AVIOReader.liveRefusalWait(retryAfter: 2) == 2)
+        #expect(AVIOReader.liveRefusalWait(retryAfter: 5) == 5)
+        #expect(AVIOReader.liveRefusalWait(retryAfter: 30) == 5)
     }
 
-    // MARK: - Tests
+    // MARK: - The stream
 
-    @Test("a stream refused mid-session is asked for again every second until it is served")
-    func refusedMidStreamIsRetriedEverySecond() throws {
+    @Test("a stream refused mid-session is asked for again until it is served, and arms no pacer")
+    func refusedMidStreamIsRetriedUntilServed() throws {
+        AetherEngine.reconnectBackoffScaleForTesting = 0.02
+        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
         let first = Self.streamBytes(count: 400)
         let second = Self.streamBytes(count: 400)
+        let refusals = 3
         let origin = try #require(ScriptedOrigin { index in
             switch index {
             case 0: return .init(status: 200, body: first)
-            case 1, 2, 3: return .init(status: 509)
+            case 1...refusals: return .init(status: 509)
             default: return .init(status: 200, body: second)
             }
         })
@@ -141,60 +155,28 @@ struct LiveStreamRefusalRetryTests {
 
         #expect(drained.failure == nil)
         #expect(drained.bytes >= first.count + second.count)
-        let times = origin.requestTimes
-        #expect(times.count >= 5)
-        // The three refusals are retried a second apart, give or take the request itself and a
-        // loaded test host; never up the 0.5, 1, 2, 4 s ladder, whose third rung alone is 4 s.
-        let retryGaps = Array(Self.gaps(times).dropFirst()).prefix(3)
-        #expect(retryGaps.count == 3)
-        for gap in retryGaps {
-            #expect(gap >= 0.9 && gap <= 3.5, "retry gap \(gap)s")
-        }
-        #expect(retryGaps.reduce(0, +) <= 7, "retry gaps \(Array(retryGaps))")
+        // The first body, the refusals, and the body that followed them: nothing was given up on
+        // and nothing asked twice over.
+        #expect(origin.requestCount >= refusals + 2)
         // The refusals armed no pacer and lowered no budget: the books hold no refusal for this
         // origin (a witness stamp carries no count).
         let books = OriginRequestBudget.shared.snapshot(for: origin.url)
         #expect((books?.refusals ?? 0) == 0)
         #expect(books?.limit == nil)
-    }
-
-    @Test("the origin's Retry-After stretches the wait, up to five seconds")
-    func retryAfterStretchesTheWait() throws {
-        let first = Self.streamBytes(count: 400)
-        let second = Self.streamBytes(count: 400)
-        let origin = try #require(ScriptedOrigin { index in
-            switch index {
-            case 0: return .init(status: 200, body: first)
-            case 1: return .init(status: 503, headers: ["Retry-After": "2"])
-            case 2: return .init(status: 503, headers: ["Retry-After": "30"])
-            default: return .init(status: 200, body: second)
-            }
-        })
-        defer { origin.stop() }
-        let reader = Self.makeLiveReader(origin.url)
-        defer { reader.markClosed(); reader.close() }
-        try reader.open()
-
-        let drained = Self.drain(reader, expectedBytes: first.count + second.count)
-
-        #expect(drained.failure == nil)
-        let retryGaps = Array(Self.gaps(origin.requestTimes).dropFirst())
-        #expect(retryGaps.count >= 2)
-        if retryGaps.count >= 2 {
-            #expect(retryGaps[0] >= 1.9 && retryGaps[0] <= 4.5, "Retry-After 2 gap \(retryGaps[0])s")
-            #expect(retryGaps[1] >= 4.9 && retryGaps[1] <= 8, "Retry-After 30 capped gap \(retryGaps[1])s")
-        }
+        #expect(!OriginRequestBudget.shared.isPaced(origin.url))
     }
 
     @Test("a stream refused for longer than the budget ends as a read error")
     func refusedPastTheBudgetGivesUp() throws {
+        AetherEngine.reconnectBackoffScaleForTesting = 0.02
+        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
+        AVIOReader.liveRefusalRetryBudgetForTesting = 1
+        defer { AVIOReader.liveRefusalRetryBudgetForTesting = nil }
         let first = Self.streamBytes(count: 400)
         let origin = try #require(ScriptedOrigin { index in
             index == 0 ? .init(status: 200, body: first) : .init(status: 509)
         })
         defer { origin.stop() }
-        AVIOReader.liveRefusalRetryBudgetForTesting = 3
-        defer { AVIOReader.liveRefusalRetryBudgetForTesting = nil }
         let reader = Self.makeLiveReader(origin.url)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
@@ -203,10 +185,12 @@ struct LiveStreamRefusalRetryTests {
 
         #expect(drained.bytes == first.count)
         #expect(drained.failure == FFmpegErr.eio)
-        // Asked about three times over the budget, one a second, then given up.
-        let refusals = origin.requestTimes.count - 1
-        #expect(refusals >= 3 && refusals <= 6, "\(refusals) refused attempts")
+        // Asked again more than the old count-based ladder's six would allow at this pace, and
+        // only given up once the budget ran out.
+        #expect(origin.requestCount - 1 >= 3, "\(origin.requestCount - 1) refused attempts")
     }
+
+    // MARK: - The open
 
     @Test("a live open the origin refuses fails typed with its status at once")
     func refusedOpenFailsTyped() throws {
@@ -215,11 +199,10 @@ struct LiveStreamRefusalRetryTests {
         let reader = Self.makeLiveReader(origin.url)
         defer { reader.markClosed(); reader.close() }
 
-        let started = Date()
         let failure = #expect(throws: AVIOReaderError.self) { try reader.open() }
         #expect(failure == .httpStatus(509))
-        #expect(Date().timeIntervalSince(started) < 5)
-        #expect(origin.requestTimes.count == 1)
+        // The one request, not the read loop's ladder on the same one.
+        #expect(origin.requestCount == 1)
     }
 
     @Test("a live open answered 403 fails typed too")
@@ -231,5 +214,6 @@ struct LiveStreamRefusalRetryTests {
 
         let failure = #expect(throws: AVIOReaderError.self) { try reader.open() }
         #expect(failure == .httpStatus(403))
+        #expect(origin.requestCount == 1)
     }
 }

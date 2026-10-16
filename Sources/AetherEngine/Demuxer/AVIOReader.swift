@@ -775,6 +775,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     static let liveRefusalRetryBudget: TimeInterval = 60
     /// Test seam: a shorter budget, so the give-up is exercised without a minute of wall clock.
     nonisolated(unsafe) static var liveRefusalRetryBudgetForTesting: TimeInterval?
+
+    /// The wait before a live stream's refused request is made again: a second, or the origin's
+    /// Retry-After (0 for none) when that is longer, never more than `liveRefusalMaximumRetryWait`.
+    static func liveRefusalWait(retryAfter: TimeInterval) -> TimeInterval {
+        min(max(liveRefusalRetryInterval, retryAfter), liveRefusalMaximumRetryWait)
+    }
     // Rate-limited attempts that keep the pinned redirect target before one attempt through the
     // source URL is spent on a fresh redirect. Three paced attempts (~7 s of ladder) ride out the
     // lingering-slot 509 of a connection-capped panel (#307 follow-up: the slot frees in seconds);
@@ -2779,7 +2785,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// non-blocking one in `chargeFaultedRunwayRefill`, so both pace an origin identically.
     private func backoffDelay(streak: Int, retryAfter: TimeInterval, isRateLimited: Bool = false) -> TimeInterval {
         if isLive, isRateLimited {
-            return min(max(Self.liveRefusalRetryInterval, retryAfter), Self.liveRefusalMaximumRetryWait) * backoffScale
+            return Self.liveRefusalWait(retryAfter: retryAfter) * backoffScale
         }
         let expo = streak <= 0 ? 0.0 : min(Double(1 << min(streak, 4)) * 0.5, 8.0)
         return min(max(expo, retryAfter), 15.0) * backoffScale
