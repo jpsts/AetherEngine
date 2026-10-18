@@ -80,6 +80,14 @@ the public-API contract.
   loop reads again. Seen on DVD-Video, whose time-map seek settles at once: a seek past the first
   cell ended playback in 7 of 8 runs, in none of 8 with the fix (48 seeks that missed the cache).
 
+- **The audio tap follows long segments forward instead of looping on the first two.** The
+  native and remote-HLS readers judged a backward seek by the end of the last decoded segment, so
+  any segment longer than the 2 s pacing tolerance read as one the moment it was decoded: with
+  10 s segments the reader re-anchored after every second segment and emitted the same 20 s again
+  four times a second. They now judge it by that segment's start. A segment's burst also overran
+  the stream's 64-buffer window and lost its first seconds; the stream now holds 256 buffers
+  (25.6 s). A host transcribing the tap got the opening seconds over and over, with gaps.
+
 ## [7.47.0] - 2026-10-23
 
 ### Added
