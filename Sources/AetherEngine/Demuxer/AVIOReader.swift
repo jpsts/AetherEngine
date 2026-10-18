@@ -753,8 +753,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Effective per-fetch budget for a detour block: the tight interactive cap, never exceeding the
     /// caller's chunk budget (still-extraction passes a smaller one; it never reaches this path, but
     /// the clamp keeps the invariant). Internal so the bound is unit-tested without a live origin.
-    static func effectiveDetourBudget(chunkRequestTimeout: TimeInterval) -> TimeInterval {
-        min(detourFetchBudgetSeconds, chunkRequestTimeout)
+    static func effectiveDetourBudget(chunkRequestTimeout: TimeInterval,
+                                      cap: TimeInterval = detourFetchBudgetSeconds) -> TimeInterval {
+        min(cap, chunkRequestTimeout)
     }
 
     // Cap on CONSECUTIVE rate-limited (429/503/509) network attempts before giving up cleanly.
@@ -773,8 +774,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     static let liveRefusalMaximumRetryWait: TimeInterval = 5
     /// How long a live stream keeps asking before the refusal is the session's answer.
     static let liveRefusalRetryBudget: TimeInterval = 60
-    /// Test seam: a shorter budget, so the give-up is exercised without a minute of wall clock.
-    nonisolated(unsafe) static var liveRefusalRetryBudgetForTesting: TimeInterval?
 
     /// The wait before a live stream's refused request is made again: a second, or the origin's
     /// Retry-After (0 for none) when that is longer, never more than `liveRefusalMaximumRetryWait`.
@@ -1001,12 +1000,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var bytesAtLastReconnect: Int64 = 0
     // Consecutive rate-limited attempts; survives seekReconnect, resets on real read progress (#71).
     private var rateLimitStreak = 0
-    /// When the current rate-limited streak began, for the live budget. Cleared with the streak.
-    private var rateLimitStreakStartedAt: DispatchTime?
     // AE#792: consecutive 401/403 ends on one credential. Survives seekReconnect like the rate-limit
     // streak, resets on real read progress and whenever the header store's revision moves.
     private var credentialRefusalStreak = 0
     private var credentialStreakRevision: UInt64?
+    /// When the current rate-limited streak began, for the live budget. Cleared with the streak.
+    private var rateLimitStreakStartedAt: DispatchTime?
 
     /// Detour LRU block cache (its own leaf lock, never held across `fetchChunk`/network or
     /// `winCond`). Stores only full-size blocks; short bodies are served once but never cached
@@ -1020,6 +1019,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the same reason `connStallTimeout` is one: a process-wide hook would leak into whatever suite
     /// runs concurrently.
     private let detourBlockIdleSeconds: TimeInterval
+    // The interactive cap on a detour fetch; tests that assert a block lands raise it, since 4 s is
+    // a wall clock a loaded runner can spend before the fetch does.
+    private let detourFetchBudget: TimeInterval
     // Re-anchor run tracking (demux-thread-only): the file offset the next sequential detour read
     // would continue from, and how many contiguous bytes the current detour run has served.
     private var detourRunNextExpected: Int64 = -1
@@ -1132,16 +1134,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// TEST-ONLY slow-CDN throttle (kbit/s, 0 = unlimited), captured once from the static hook at init.
     private let throttleKbps: Int
-    /// TEST-ONLY reconnect-backoff scale (1.0 = real timing), captured once from the static hook at init.
+    /// Reconnect-backoff scale, 1 in the shipped app; tests shrink it so a give-up spanning a dozen
+    /// backoffs finishes in test time. An init parameter like `connStallTimeout` below, for the same
+    /// reason: a process-wide hook leaked into every suite running alongside.
     private let backoffScale: Double
     /// #392: the idle gap this reader takes a first refusal at face value after. Shipped value
-    /// unless a test shortens it, captured once at init like the two hooks above.
+    /// unless a test shortens it.
     private let pinIdleSeconds: TimeInterval
+    /// How long a live refusal streak is ridden out, `liveRefusalRetryBudget` unless a test shortens it.
+    private let liveRefusalRetryBudgetSeconds: TimeInterval
     /// Stall threshold this reader runs with, `connStallTimeoutDefault` unless a caller overrides it.
     /// One value for both detectors, because they are one policy: a connection that has delivered
     /// nothing for this long is replaced, whether or not a read is waiting on it (#309).
     ///
-    /// An init parameter rather than a process-wide test hook on purpose. The hooks next to it are
+    /// An init parameter rather than a process-wide test hook on purpose. A hook is
     /// read at every reader's init, so a test that sets one changes the behaviour of every reader any
     /// CONCURRENTLY running suite happens to build, and swift-testing runs suites in parallel. A
     /// shortened stall threshold leaking that way would make other suites reconnect early under
@@ -1178,7 +1184,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let probeDrainLock = NSLock()
     private var drainingProbeRequest = false
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget) {
         self.sourceOpenPolicy = sourceOpenPolicy
         self.probeControl = probeControl
         self.probeRequestSession = probeControl == nil ? nil : probeRequestSession
@@ -1194,13 +1200,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.chunkMaxRetries = max(1, chunkMaxRetries)
         self.boundedInitialFetch = boundedInitialFetch.map { max(1, $0) }
         self.throttleKbps = AetherEngine.sourceThrottleKbpsForTesting
-        self.backoffScale = AetherEngine.reconnectBackoffScaleForTesting
-        self.pinIdleSeconds = AetherEngine.pinIdleSecondsForTesting ?? Self.pinIdleRepinSecondsDefault
+        self.backoffScale = backoffScale
+        self.pinIdleSeconds = pinIdleSeconds
+        self.liveRefusalRetryBudgetSeconds = liveRefusalRetryBudget
         self.connStallTimeout = max(0.05, connStallTimeout)
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
         self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
         self.detourBlockIdleSeconds = detourIdleSeconds ?? Self.detourBlockIdleSecondsDefault
+        self.detourFetchBudget = detourFetchBudget ?? Self.detourFetchBudgetSeconds
         self.heldConnectionEnabled = heldConnection
     }
 
@@ -1321,6 +1329,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // way the live HLS ingest reports a refused join: the host retries a 509 on its own
                 // cadence with the right words for it, where the read loop's ladder would have spent
                 // the open budget on the same request and handed back an untyped read failure.
+                // A server error is asked once more first, as the read loop did before this was typed:
+                // a 500/502 while a tuner or transcode spins up is the moment's, not the channel's.
+                if !opened, isLive, let refusal = refusalOfLiveOpenConnection(),
+                   Self.isResolvedHardServerError(refusal) {
+                    EngineLog.emit(
+                        "[AVIOReader] \(label) live open answered status=\(refusal); asking once more",
+                        category: .demux)
+                    backoffBeforeReconnect(streak: 1, retryAfter: 0)
+                    try probeControl?.check()
+                    guard !isClosed else { throw CancellationError() }
+                    startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
+                    opened = awaitFirstPersistentData()
+                }
                 if !opened, isLive, let refusal = refusalOfLiveOpenConnection() {
                     EngineLog.emit(
                         "[AVIOReader] \(label) live open refused status=\(refusal); failing the open typed",
@@ -2498,8 +2519,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if connFirstDataSeen {
                     unproductiveReconnects = 0      // real progress
                     rateLimitStreak = 0             // real progress clears the 429 give-up streak (#71)
-                    rateLimitStreakStartedAt = nil
                     credentialRefusalStreak = 0     // and the credential one (#792)
+                    rateLimitStreakStartedAt = nil
                     emitNetworkPhase(.flowing)      // recovered: source delivering again (#85/#410)
                 }
                 // No flow installed and the consumer has drawn down to low water: request at the
@@ -2870,7 +2891,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let now = DispatchTime.now()
             let started = rateLimitStreakStartedAt ?? now
             rateLimitStreakStartedAt = started
-            let budget = Self.liveRefusalRetryBudgetForTesting ?? Self.liveRefusalRetryBudget
+            let budget = liveRefusalRetryBudgetSeconds
             let elapsed = Double(now.uptimeNanoseconds &- started.uptimeNanoseconds) / 1_000_000_000
             return elapsed > budget
         }
@@ -2963,7 +2984,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// took the last slot of a two-request origin and left the inner one waiting its whole budget for
     /// a slot this same fetch was holding, +4 s per block, with a third request on the books.
     private func detourFetchBlock(from offset: Int64, size: Int) -> DetourFetch {
-        let budget = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout)
+        let budget = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout, cap: detourFetchBudget)
         let rangeEnd = offset + Int64(size) - 1
         var request = URLRequest(url: requestURL())
         request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
@@ -3123,7 +3144,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         var request = URLRequest(url: url)
         request.setValue("bytes=-\(Self.tailPrefetchBytes)", forHTTPHeaderField: "Range")
-        request.timeoutInterval = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout)
+        request.timeoutInterval = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout, cap: detourFetchBudget)
         applyExtraHeaders(&request)
 
         // A delegate rather than a completion handler, and the distinction is load-bearing: a

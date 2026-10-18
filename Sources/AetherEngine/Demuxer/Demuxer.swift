@@ -1664,7 +1664,7 @@ public final class Demuxer: @unchecked Sendable {
         guard layout.pointee.nb_channels > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: 64)
         guard av_channel_layout_describe(layout, &buffer, buffer.count) > 0 else { return nil }
-        return String(cString: buffer)
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     /// The language to publish for a stream. A disc keeps its track languages in its navigation data

@@ -122,7 +122,9 @@ struct SoftwareResidentRangesTests {
         let source = try source(packets, store: store)
         defer { source.close() }
         try await consume(source, expecting: packets, fails: false)
-        #expect(source.residentRanges == [0...16])
+        // The history is volatile VM, so under a full suite's memory pressure the kernel may already
+        // have emptied some of it here (seen: [15.36...16]); the purge below forces the rest.
+        #expect(source.residentRanges.last?.upperBound == 16)
         store.purgeHistoryForTesting()
         let spans = source.residentRanges
         #expect((spans.first?.lowerBound ?? 0) > 0)
