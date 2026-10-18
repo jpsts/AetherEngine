@@ -10,7 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The audio tap follows long segments forward instead of looping on the first two.** The
+  native and remote-HLS readers judged a backward seek by the end of the last decoded segment, so
+  any segment longer than the 2 s pacing tolerance read as one the moment it was decoded: with
+  10 s segments the reader re-anchored after every second segment and emitted the same 20 s again
+  four times a second. They now judge it by that segment's start. A segment's burst also overran
+  the stream's 64-buffer window and lost its first seconds; the stream now holds 256 buffers
+  (25.6 s). A host transcribing the tap got the opening seconds over and over, with gaps.
 
 ## [7.40.1] - 2026-10-18
 
