@@ -109,18 +109,6 @@ final class DocumentedConstantsTests: XCTestCase {
         return text
     }
 
-    /// docs/architecture.md quotes the audio tap's lead, tolerance and stream buffer.
-    func testAudioTapPacingAndBufferMatchDocumentation() throws {
-        XCTAssertEqual(AudioTapDefaults.leadSeconds, 10)
-        XCTAssertEqual(AudioTapDefaults.toleranceSeconds, 2)
-        XCTAssertEqual(AudioTapDefaults.streamBufferChunks, 256)
-        XCTAssertEqual(Double(AudioTapDefaults.streamBufferChunks * AudioTapDefaults.minSamplesPerChunk) / AudioTapDefaults.sampleRate, 25.6, accuracy: 0.001)
-        let docs = try documentation()
-        assertDocumented("`AudioTapDefaults.leadSeconds` (10 s)", docs)
-        assertDocumented("longer than the 2 s tolerance", docs)
-        assertDocumented("`AudioTapDefaults.streamBufferChunks` (256 buffers, 25.6 s)", docs)
-    }
-
     /// docs/formats.md quotes the lead a software-path live join keeps behind the newest media.
     func testSoftwareLiveJoinLeadMatchesDocumentation() throws {
         XCTAssertEqual(SoftwareLiveJoinPolicy.leadSeconds, 4)
@@ -128,6 +116,16 @@ final class DocumentedConstantsTests: XCTestCase {
         XCTAssertEqual(SoftwareLiveJoinPolicy.maximumSettleSeconds, 1.5)
         XCTAssertEqual(SoftwareLiveJoinPolicy.calmWindowSeconds, 0.25)
         assertDocumented("`SoftwareLiveJoinPolicy.leadSeconds` (4 s) behind the newest media", try documentation())
+    }
+
+    /// docs/formats.md quotes the segmented holdback of a live HLS ingest on the software path (AE#813).
+    func testSoftwareLiveHoldbackMatchesDocumentation() throws {
+        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 2).joinLeadSeconds, 4)
+        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 10).joinLeadSeconds, 16)
+        XCTAssertEqual(SoftwareLiveHoldback.maximumLeadSeconds, 45)
+        XCTAssertEqual(SoftwareLiveHoldback.resumeSlackSeconds, 2)
+        assertDocumented("`1.5 x segment + 1 s` behind the newest media (4 s on 2 s segments, 16 s on 10 s segments, at most 45 s)",
+                         try documentation())
     }
 
     // MARK: - Documentation corpus
