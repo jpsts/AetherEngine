@@ -34,6 +34,14 @@ the public-API contract.
 
 ### Fixed
 
+- **The audio tap follows long segments forward instead of looping on the first two.** The
+  native and remote-HLS readers judged a backward seek by the end of the last decoded segment, so
+  any segment longer than the 2 s pacing tolerance read as one the moment it was decoded: with
+  10 s segments the reader re-anchored after every second segment and emitted the same 20 s again
+  four times a second. They now judge it by that segment's start. A segment's burst also overran
+  the stream's 64-buffer window and lost its first seconds; the stream now holds 256 buffers
+  (25.6 s). A host transcribing the tap got the opening seconds over and over, with gaps.
+
 - **A pump that cannot keep up on the efficiency class stops dropping to it (#850, thanks @imbenjamin).**
   The AE#286 relaxation moved the segment pump to `.utility` once it was 16 s ahead, on the
   assumption that it still produces faster than real time there. A 4K Dolby Vision remux with
@@ -107,13 +115,13 @@ the public-API contract.
   route afresh: those either change the picture or follow a return from the background, where the
   display may have changed.
 
-- **The audio tap follows long segments forward instead of looping on the first two.** The
-  native and remote-HLS readers judged a backward seek by the end of the last decoded segment, so
-  any segment longer than the 2 s pacing tolerance read as one the moment it was decoded: with
-  10 s segments the reader re-anchored after every second segment and emitted the same 20 s again
-  four times a second. They now judge it by that segment's start. A segment's burst also overran
-  the stream's 64-buffer window and lost its first seconds; the stream now holds 256 buffers
-  (25.6 s). A host transcribing the tap got the opening seconds over and over, with gaps.
+- **A refused HDR master no longer latches the panel refusal on iOS and macOS (#849).** The AE#588
+  latch only moves the panel answer, and the routing on a panel that engages HDR on demand reads the
+  display's eligibility instead, so on those platforms it changed nothing except a log line claiming
+  every later HDR title went media-direct. Such a refusal is not a fact about the panel either: on a
+  MacBook Air M1 SDR panel a Dolby Vision P8.1 master with and without `SUPPLEMENTAL-CODECS`, a
+  High-tier 3832x1600 PQ master and an audio switch to AC-3 on each were all accepted. The item still
+  falls back, later titles are still offered the master, and the log now says so. tvOS is unchanged.
 
 ## [7.47.0] - 2026-10-23
 
