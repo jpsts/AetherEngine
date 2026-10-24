@@ -34,6 +34,16 @@ the public-API contract.
 
 ### Fixed
 
+- **A pump that cannot keep up on the efficiency class stops dropping to it (#850, thanks @imbenjamin).**
+  The AE#286 relaxation moved the segment pump to `.utility` once it was 16 s ahead, on the
+  assumption that it still produces faster than real time there. A 4K Dolby Vision remux with
+  TrueHD Atmos rendered to APAC on an A15 Apple TV made 0.10 to 0.51x on `.utility`, so every
+  relaxed stretch drained the lead, the forward window never filled and VOD stalled every few
+  minutes. The pump now measures what it produces against wall time while relaxed and stays on
+  `.userInitiated` for the rest of the session once that falls below real time, and it rechecks
+  once a second instead of only at segment boundaries, where one slow segment had outlasted the
+  whole lead. A session that keeps up relaxes exactly as before.
+
 - **HDR10+ reaches the display on the software path (#814, thanks @williamliu0516).** The VideoToolbox decoder there never read the
   ST 2094-40 SEI, so a PQ HEVC title played as plain HDR10 and `videoFormat` stayed `.hdr10`; it now
   reports `.hdr10Plus` on the first message and hands each frame its payload as
@@ -79,6 +89,15 @@ the public-API contract.
   when the producer has seen the source's own end; before that the read throws `.interrupted` and the
   loop reads again. Seen on DVD-Video, whose time-map seek settles at once: a seek past the first
   cell ended playback in 7 of 8 runs, in none of 8 with the fix (48 seeks that missed the cache).
+
+- **A session-preserving reload recovers from its own master rejection again (#849, thanks @adityabakare).**
+  The reactive master-to-media fallback is single-shot per session, and its latch was reset only in
+  `load()`'s prologue, which `reloadWithAudioOverride` and `reloadAtCurrentPosition` never pass
+  through. A fallback spent on the outgoing session's master (a Dolby Vision P8.1 source's one
+  `-11868` at mount) carried into the reload, so the rebuilt master's own rejection (an audio switch
+  to AC-3 on macOS) was signalled but never mounted the media playlist and ended the session at
+  `.masterPlaylistRejected` ("Cannot open"). The latch now resets in `stopInternal`, the teardown
+  every rebuild passes through.
 
 - **The audio tap follows long segments forward instead of looping on the first two.** The
   native and remote-HLS readers judged a backward seek by the end of the last decoded segment, so
