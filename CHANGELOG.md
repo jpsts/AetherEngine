@@ -26,6 +26,20 @@ the public-API contract.
   which Xcode's Thread Performance Checker reported as a hang risk in
   `HLSSegmentProducer.waitForFinish`. The pump now returns to `.userInitiated` as it leaves its read
   loop and stays there until it has finished.
+- **A software live session reports its edge rebuffer as `.rebuffering`.** When the source paused, the
+  live feeder parked the synchronizer to refill but kept that to itself: `playbackPhase` stayed
+  `.playing` over a standing picture until the reader's own stall timeout promoted the source to
+  `.stalled`, 20 s later. A host app watching the clock reloaded the session after 2 s, and each fresh
+  join landed the lead behind the same frozen burst, so the viewer saw the last four seconds again,
+  three times over, before the feed came back. `SoftwarePlaybackHost.isRebuffering` now follows the
+  pumps' hold (the live feeder's dry ring and the on-demand loop's exhausted audio lead) and the
+  engine folds it into `isBuffering`, as it does the audio host's wait.
+- **A software live session catches up after a pause whose backlog arrives at once.** A source that
+  resumes by handing over everything it missed left the picture the length of the pause behind the
+  newest media, and nothing on that path ever caught up. The feeder now watches a resume with the
+  join's own rule and, once the backlog has landed, moves the picture up to the join lead behind the
+  newest media through the engine's live rejoin seek; a source that skipped what it missed is left
+  where it resumed.
 
 ## [7.46.0] - 2026-10-22
 
