@@ -12,15 +12,84 @@ the public-API contract.
 
 ### Added
 
+- **Remote MPEG-DASH on-demand manifests play (AE#859, thanks @qoli).**
+  A static, single-Period MPD whose representations are single files addressed by `SegmentBase`
+  failed at open with `Invalid data found when processing input`: the FFmpeg build has no DASH
+  demuxer and no network protocols. The engine now recognizes the manifest (by `.mpd`, or by its
+  body on an extensionless URL), fetches each selected representation's initialization segment and
+  segment index, and lays the video plus one representation per audio adaptation set out as one
+  fragmented MP4 that the normal `mov` path demuxes, so both playback routes, seeks, audio track
+  switching and `probe` work unchanged. Headers ride every request. Live manifests, `SegmentTemplate`
+  / `SegmentList` and encrypted content are refused with the reason. See `docs/formats.md`.
+
 - **`isClockHeld` and `clockHoldEvents` publish the software path's clock hold (AE#800, thanks @cmcpherson274).**
   The clock that waits for the first frames after a start, a seek, an in-place switch or a resume
   stood at rate 0 with nothing but an `[AudioOutput]` log line to say so, so a host judging stalls
   from the clock counted the hold as one, and with several engines at once could not tell whose line
   it was. The level and a `.began` / `.released(.ready | .timedOut | .cancelled)` stream now come from
   each engine instance. See `docs/api.md`.
+- **The software host (the Dolby Vision FEL route) can now show a Now-Playing card and answer remote
+  commands.** It has no `AVPlayer`, so it had neither. With the new `ownsSoftwareNowPlaying` set (off by
+  default, independent of `ownsVideoNowPlayingSession`), the engine publishes title, artwork, duration,
+  elapsed and rate from the staged `externalMetadata` / `setVideoNowPlayingInfo`, and serves play, pause,
+  toggle, skip (`remoteSkipInterval`, default 10 s) and change-position from the Siri Remote, headsets,
+  Control Center and media keys. It republishes on seek, pause, speed change, stall and end.
+  `softwareNowPlayingActive` tells a host when to add its own next/previous. The AVPlayer paths are
+  unchanged.
+- **Scrub thumbnails work on a software session that plays a local file.**
+  `supportsCacheBackedStills` was false there and `scrubThumbnail` and `scrubPreviewFrame` answered
+  nil, so a Dolby Vision FEL title (which plays through the software host) had no scrub stills
+  unless the host built its own `FrameExtractor`. The engine now decodes them from the file, the
+  base layer for a dual-layer title, with no extra connection and through the same calls the
+  AVPlayer path answers: `scrubPreviewFrame` honours `isCancelled` and the 750 ms / 900 packet bound
+  and reports the decoded frame's own time. A file on a network mount opens a second file handle.
+  A Dolby Vision Profile 5 / 10.0 file without the `DolbyVisionStillReshaping` trait keeps
+  `supportsCacheBackedStills` false, since none of its frames can become a still. Remote software
+  sessions already served stills from the packet cache.
+- **The software host follows the system caption style.** Subtitles composited into software-path
+  PiP frames now use the user's Settings > Accessibility > Subtitles & Captioning choices (font,
+  size, text colour and opacity, background and window colour and opacity, edge style) the way
+  AVPlayer's legible output does, and re-render when the setting changes. A field counts as chosen
+  only where it differs from the system default, and carries the system's precedence against the
+  cue's own styling. `SubtitleCaptionStyle.current()` and `observeChanges(_:)` expose the same style
+  to a host that draws its own overlay. Bitmap subtitles are untouched.
+- **The software playback host keeps Atmos.** On the software host (the Dolby Vision FEL route and
+  video the hardware decoder cannot play), E-AC-3 JOC is handed to the audio renderer compressed,
+  with the decoder primed once per process, and TrueHD Atmos and DTS:X are rendered to APAC under the
+  existing `objectAudioRendering` option (DTS:X into 7.1.4 or 9.1.6 only, and a TrueHD track whose
+  profile the probe missed read from its own major sync, as on the loopback route). Other audio,
+  live streams and `.off` still decode to PCM, and a TrueHD or DTS track kept on PCM says why in the
+  log. The automatic audio pick now prefers a TrueHD Atmos or DTS:X track on the software host too. A
+  renderer error on these routes is logged in release builds. On tvOS the Atmos output activator
+  runs on HDMI beside the routes that carry Dolby Atmos (TrueHD Atmos as APAC and compressed E-AC-3
+  JOC, not DTS:X), as it does beside the loopback route's TrueHD APAC, so a sink that needs it shows
+  Atmos for the software host too. `audioDelivery` reports them as `.bridged` (APAC) and
+  `.streamCopy` (compressed E-AC-3 JOC), and `activeAudioDecoder` names them (for example
+  "TRUEHD Atmos → APAC 7.1.4"); the PCM decode stays `.decoded`. The clock's "audio is not
+  recovering" fallback waits for the APAC route's first buffer (about 100 TrueHD access units) instead
+  of anchoring every TrueHD load on video after 50 packets.
+- **The renderer paths pause when a removable audio output goes away.** On iOS and tvOS the software
+  host and the audio host now pause, as AVPlayer does, when headphones, a Bluetooth device (A2DP, LE,
+  HFP), an AirPlay output or a USB output is removed while playing or seeking. HDMI is not one of
+  them: an ARC / eARC soundbar or receiver switching on or off on an Apple TV keeps playing. The
+  native path is unchanged.
 
 ### Changed
 
+- **A Profile 7 FEL source keeps the native route while the host reports an AirPlay video receiver on the audio route (iOS).**
+  The dual-layer route draws into a local layer that no receiver picks up, so a TV the viewer sent the
+  title to played sound only. When the host says the receiver shows video
+  (`setAirPlayReceiverShowsVideo(_:)`, new, default off), the load takes the native route instead (8.1
+  where the display takes Dolby Vision, the enhancement layer is lost), logs
+  `an AirPlay video receiver ...` as the reason and skips the `el_type` scan. An audio-only output such
+  as a HomePod does not set it, so the title keeps the dual-layer route; the engine cannot tell the two
+  apart itself. The route is decided at each load: on a URL source `reloadAtCurrentPosition()` decides
+  again, a custom source keeps its route until the next `load()`.
+- **The software host waits for a running display-mode switch before it starts playing (tvOS).** The
+  native path already did; the software path gave up on an HDR switch at the pre-flight cap and never
+  waited for a rate-only one.
+- **`airPlayPictureStaysLocal` reads false while the screen is mirrored.** The host reports it through
+  `setScreenMirrored(_:)` (new).
 - **TrueHD Atmos is decoded exactly and its objects are rendered again (#731).**
   Since 7.40.0 the `TrueHDObjectAudio` path built every output out of the stream's 7.1 channel
   presentation, split by where the objects' energy lay, with the objects decoded without their matrix
@@ -32,15 +101,22 @@ the public-API contract.
   and the `TrueHDReferenceRender` measurement trait are gone. The trait stays opt-in, and the
   integrator remains responsible for the licensing of what it enables.
 
+- **PGS subtitle tracks no longer hold the playback probe to its byte ceiling (#858, thanks @qoli).**
+  `find_stream_info` will not let a PGS track go until a decoded composition segment has given it
+  a width. PGS is sparse, so on a source whose first cue lies past the probe, one such track kept
+  the main open reading to the 50 MiB ceiling (about 14 s on the reported remote Matroska source
+  with four of them). Known PGS tracks now sit out the probe the way undecodable audio does
+  (#466). Every track keeps its index, language and codec. The canvas comes from the decoded
+  composition segment, with the video size as fallback, just as on the subtitle side reader
+  since #87.
+
 ### Fixed
 
-- **The audio tap follows long segments forward instead of looping on the first two.** The
-  native and remote-HLS readers judged a backward seek by the end of the last decoded segment, so
-  any segment longer than the 2 s pacing tolerance read as one the moment it was decoded: with
-  10 s segments the reader re-anchored after every second segment and emitted the same 20 s again
-  four times a second. They now judge it by that segment's start. A segment's burst also overran
-  the stream's 64-buffer window and lost its first seconds; the stream now holds 256 buffers
-  (25.6 s). A host transcribing the tap got the opening seconds over and over, with gaps.
+- **A forward seek in a fragmented MP4 no longer lands a fragment or more past its target (AE#859).**
+  libavformat indexes a fragmented file one fragment at a time, and a stream seek whose next sync
+  sample started an unread fragment resolved to whatever later fragment an earlier read had indexed:
+  a session started at 150 s and seeked to 60 s rendered 122 s. The seek now lands on the sync
+  sample before the target when the index has a hole there.
 
 - **A pump that cannot keep up on the efficiency class stops dropping to it (#850, thanks @imbenjamin).**
   The AE#286 relaxation moved the segment pump to `.utility` once it was 16 s ahead, on the
@@ -123,6 +199,14 @@ the public-API contract.
   High-tier 3832x1600 PQ master and an audio switch to AC-3 on each were all accepted. The item still
   falls back, later titles are still offered the master, and the log now says so. tvOS is unchanged.
 
+- **The audio tap follows long segments forward instead of looping on the first two.** The
+  native and remote-HLS readers judged a backward seek by the end of the last decoded segment, so
+  any segment longer than the 2 s pacing tolerance read as one the moment it was decoded: with
+  10 s segments the reader re-anchored after every second segment and emitted the same 20 s again
+  four times a second. They now judge it by that segment's start. A segment's burst also overran
+  the stream's 64-buffer window and lost its first seconds; the stream now holds 256 buffers
+  (25.6 s). A host transcribing the tap got the opening seconds over and over, with gaps.
+
 ## [7.47.0] - 2026-10-23
 
 ### Added
@@ -153,6 +237,8 @@ the public-API contract.
   build.** The shipped TrueHD path already took every object as a point; the panner's size and snap
   code and the element state's size, snap and zone fields are now compiled out of it as well. No
   change to what a shipped build plays.
+- `setRate(0)` disarms the resume after an audio-session interruption on every path, as `pause()`
+  does: a session the host set to rate 0 stays paused when the interruption ends.
 
 ### Fixed
 
@@ -172,6 +258,16 @@ the public-API contract.
   there and waits, at most 3 s, until the lead over the newest media stands where the unmoved start
   had it (capped at the 2 s rebuffer resume lead); without one the audio read before that keyframe is
   dropped. A stream that flags no keyframe keeps its old start after 3 s.
+- **A display that never raises its EDR headroom keeps its HDR / Dolby Vision label across engines
+  and on the software host (AE#459).** An Apple TV 4K (1st gen, tvOS 26.6) read a headroom of 1.00
+  through every HDR session, so the only proof it gave was AVFoundation accepting an HDR master, and
+  that proof was neither remembered nor shared: a host that builds an engine per item lost it at every
+  load, and the Dolby Vision FEL route, which has no master to accept, labelled every session SDR
+  while the panel showed Dolby Vision. An accepted HDR master now latches the same proof a headroom
+  reading does, and the proof belongs to the process. It is read only while `eligibleForHDRPlayback`
+  holds, and forgotten when the app leaves for the background (observed process-wide, with or without
+  an engine alive) and when a display refuses an HDR master (AE#588's rule), since either can mean the
+  output configuration changed.
 
 ## [7.46.0] - 2026-10-22
 
