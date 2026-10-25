@@ -19,6 +19,13 @@ the public-API contract.
   four times a second. They now judge it by that segment's start. A segment's burst also overran
   the stream's 64-buffer window and lost its first seconds; the stream now holds 256 buffers
   (25.6 s). A host transcribing the tap got the opening seconds over and over, with gaps.
+- **A seek no longer waits on a segment pump running at the efficiency class.** A VOD pump far
+  enough ahead of playback relaxes to `.utility` (AE#286), and a seek's restart stops it and waits
+  for it to finish from the loopback server's `.userInitiated` queue. A condition donates no
+  priority to the thread it waits for, so the pump tore down and signalled its finish at `.utility`,
+  which Xcode's Thread Performance Checker reported as a hang risk in
+  `HLSSegmentProducer.waitForFinish`. The pump now returns to `.userInitiated` as it leaves its read
+  loop and stays there until it has finished.
 
 ## [7.46.0] - 2026-10-22
 
