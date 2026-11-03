@@ -3171,7 +3171,8 @@ final class SoftwarePlaybackHost {
         var prevRawVideoPtsSec = Double.nan
         var frameIntervalSec = 0.0
         var discontinuityOffsetSec = 0.0
-        var loggedSWDiscontinuity = false
+        var loggedSWDiscontinuities = 0
+        var holeFold = LiveHoleFold()
         var audioAxis = LiveAudioAxis()
         var lastSeenExtradata: Data? = nil
         let replayReader = LiveReplayPacketReader(videoIndex: videoStreamIndex, audioIndex: audioStreamIndex,
@@ -3271,12 +3272,17 @@ final class SoftwarePlaybackHost {
                 let rawPtsSec = Double(packet.pointee.pts) * videoTimeBaseSeconds
                 if !prevRawVideoPtsSec.isNaN {
                     let deltaSec = rawPtsSec - prevRawVideoPtsSec
-                    if abs(deltaSec) >= discontinuityThresholdSeconds {
+                    if abs(deltaSec) >= discontinuityThresholdSeconds
+                        || holeFold.opensHole(videoSeconds: rawPtsSec) {
                         let expectedContinuation = prevRawVideoPtsSec
                             + (frameIntervalSec > 0 ? frameIntervalSec : 0)
+                        if deltaSec > 0 {
+                            holeFold.noteFold(fromVideoSeconds: prevRawVideoPtsSec, toVideoSeconds: rawPtsSec,
+                                              foldBefore: discontinuityOffsetSec)
+                        }
                         discontinuityOffsetSec += (rawPtsSec - expectedContinuation)
-                        if !loggedSWDiscontinuity {
-                            loggedSWDiscontinuity = true
+                        if loggedSWDiscontinuities < 20 {
+                            loggedSWDiscontinuities += 1
                             EngineLog.emit(
                                 "[SWHost] live PTS discontinuity (reader): prevPts="
                                 + "\(String(format: "%.2f", prevRawVideoPtsSec))s "
@@ -3292,14 +3298,27 @@ final class SoftwarePlaybackHost {
                     }
                 }
                 prevRawVideoPtsSec = rawPtsSec
+                holeFold.noteVideo(seconds: rawPtsSec)
             }
-            if discontinuityOffsetSec != 0 {
+            var packetFoldSeconds = discontinuityOffsetSec
+            if streamIdx == audioStreamIndex, audioTimeBaseSeconds > 0, packet.pointee.pts != Int64.min {
+                switch holeFold.audio(seconds: Double(packet.pointee.pts) * audioTimeBaseSeconds,
+                                      currentFoldSeconds: discontinuityOffsetSec) {
+                case .drop:
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    return true
+                case .play(let foldSeconds):
+                    packetFoldSeconds = foldSeconds
+                }
+            }
+            if packetFoldSeconds != 0 {
                 let tbSec = (streamIdx == videoStreamIndex)
                     ? videoTimeBaseSeconds : audioTimeBaseSeconds
                 if tbSec > 0 {
                     // Audit NAT-101: the offset spans twice the input range and converts per stream
                     // base, so a packet on the far side of a seam can still leave Int64.
-                    let offsetTicks = SourceTimestampBounds.roundedTicks(discontinuityOffsetSec / tbSec)
+                    let offsetTicks = SourceTimestampBounds.roundedTicks(packetFoldSeconds / tbSec)
                     packet.pointee.pts = SourceTimestampBounds.shifted(packet.pointee.pts, back: offsetTicks)
                     packet.pointee.dts = SourceTimestampBounds.shifted(packet.pointee.dts, back: offsetTicks)
                 }
