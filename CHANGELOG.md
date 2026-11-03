@@ -10,7 +10,13 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A live MPEG-TS source whose audio runs far from its video plays on one clock.** With audio more than a minute
+  behind video, FFmpeg's 33-bit wrap correction puts the audio about 26.5 h ahead. On the software path that audio set
+  the live edge, so the rewind buffer discarded each video keyframe as older than its window, recovery seeked about
+  once a second and the clock barely ran. `LiveAudioAxis` now moves audio more than 30 s from the video onto the
+  video's axis, aligned on arrival. `LiveAudioAxisTests` covers the wrap, seams and a still image over sound.
 
 ## [7.56.0] - 2026-11-03
 

@@ -3172,6 +3172,7 @@ final class SoftwarePlaybackHost {
         var frameIntervalSec = 0.0
         var discontinuityOffsetSec = 0.0
         var loggedSWDiscontinuity = false
+        var audioAxis = LiveAudioAxis()
         var lastSeenExtradata: Data? = nil
         let replayReader = LiveReplayPacketReader(videoIndex: videoStreamIndex, audioIndex: audioStreamIndex,
             videoTimeBase: videoTimeBaseSeconds, audioTimeBase: audioTimeBaseSeconds)
@@ -3256,6 +3257,14 @@ final class SoftwarePlaybackHost {
                 packet.pointee.pts = packet.pointee.dts
             }
 
+            // Audio on another axis than the video joins it before anything reads its timestamps.
+            if !applyLiveAudioAxis(&audioAxis, to: packet, videoIndex: videoStreamIndex, audioIndex: audioStreamIndex,
+                                   videoTimeBase: videoTimeBaseSeconds, audioTimeBase: audioTimeBaseSeconds) {
+                av_packet_unref(packet)
+                av_packet_free_safe(packet)
+                return true
+            }
+
             // Live PTS-discontinuity: same accrual as combined loop.
             if streamIdx == videoStreamIndex, videoTimeBaseSeconds > 0,
                packet.pointee.pts != Int64.min {
@@ -3335,6 +3344,34 @@ final class SoftwarePlaybackHost {
                 readerIteration()
             }
             if !keepGoing { break }
+        }
+    }
+
+    /// Moves a live audio packet onto the video's axis (`LiveAudioAxis`). False when it is to be dropped.
+    nonisolated private static func applyLiveAudioAxis(
+        _ axis: inout LiveAudioAxis,
+        to packet: UnsafeMutablePointer<AVPacket>,
+        videoIndex: Int32,
+        audioIndex: Int32,
+        videoTimeBase: Double,
+        audioTimeBase: Double
+    ) -> Bool {
+        guard videoIndex >= 0, audioIndex >= 0, packet.pointee.pts != Int64.min else { return true }
+        if packet.pointee.stream_index == videoIndex {
+            if videoTimeBase > 0 { axis.noteVideo(ptsSeconds: Double(packet.pointee.pts) * videoTimeBase) }
+            return true
+        }
+        guard packet.pointee.stream_index == audioIndex, audioTimeBase > 0 else { return true }
+        switch axis.audio(ptsSeconds: Double(packet.pointee.pts) * audioTimeBase) {
+        case .drop:
+            return false
+        case .play(let shiftSeconds):
+            if shiftSeconds != 0 {
+                let ticks = SourceTimestampBounds.roundedTicks(shiftSeconds / audioTimeBase)
+                packet.pointee.pts = SourceTimestampBounds.shifted(packet.pointee.pts, back: ticks)
+                packet.pointee.dts = SourceTimestampBounds.shifted(packet.pointee.dts, back: ticks)
+            }
+            return true
         }
     }
 
@@ -3895,6 +3932,7 @@ final class SoftwarePlaybackHost {
         var frameIntervalSec = 0.0
         var discontinuityOffsetSec = 0.0
         var loggedSeamCount = 0
+        var audioAxis = LiveAudioAxis()
         let replayReader = isLive && directLiveSource == nil ? LiveReplayPacketReader(videoIndex: videoStreamIndex,
             audioIndex: audioStreamIndex, videoTimeBase: videoTimeBaseSeconds,
             audioTimeBase: audioTimeBaseSeconds) : nil
@@ -4329,6 +4367,14 @@ final class SoftwarePlaybackHost {
             recordingTap(packet)
 
             let streamIdx = packet.pointee.stream_index
+
+            // Audio on another axis than the video joins it before anything reads its timestamps.
+            if isLive, !applyLiveAudioAxis(&audioAxis, to: packet, videoIndex: videoStreamIndex, audioIndex: audioStreamIndex,
+                                           videoTimeBase: videoTimeBaseSeconds, audioTimeBase: audioTimeBaseSeconds) {
+                av_packet_unref(packet)
+                av_packet_free_safe(packet)
+                return true
+            }
 
             // Discontinuity runs before any timestamp read; offset applied to both streams.
             if foldTimeline, streamIdx == videoStreamIndex, videoTimeBaseSeconds > 0,
