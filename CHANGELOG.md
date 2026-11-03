@@ -17,6 +17,11 @@ the public-API contract.
   the live edge, so the rewind buffer discarded each video keyframe as older than its window, recovery seeked about
   once a second and the clock barely ran. `LiveAudioAxis` now moves audio more than 30 s from the video onto the
   video's axis, aligned on arrival. `LiveAudioAxisTests` covers the wrap, seams and a still image over sound.
+- **A short hole in a live source's timestamps no longer freezes the picture on the software path's rewind route.** Only
+  jumps of 10 s or more were folded out of the timeline. A shorter hole, which a feed that pauses and skips what it
+  missed leaves behind, played out with a standing picture while the clock ran and the phase read playing. A forward
+  hole of 3 s or more that both streams have now folds (`LiveHoleFold`); a sparse picture over continuous sound is not
+  one. `LiveHoleFoldTests` covers both orders the streams can reach a hole in.
 
 ## [7.56.0] - 2026-11-03
 
