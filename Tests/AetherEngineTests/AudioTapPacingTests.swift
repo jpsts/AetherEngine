@@ -1,4 +1,5 @@
 import XCTest
+import AVFAudio
 @testable import AetherEngine
 
 /// #95: pure pacing core for the loopback audio tap reader. The reader decodes the engine's own
@@ -6,13 +7,9 @@ import XCTest
 /// to decode the next segment, idle, or re-anchor after the playhead moved away.
 final class AudioTapPacingTests: XCTestCase {
 
-    /// One-second segments: the last decoded one starts a second before it ends.
-    private func decide(_ last: Double?, _ playhead: Double) -> AudioTapPacing.Decision {
-        decide(start: last.map { $0 - 1 }, end: last, playhead)
-    }
-
-    private func decide(start: Double?, end: Double?, _ playhead: Double) -> AudioTapPacing.Decision {
-        AudioTapPacing.decide(lastDecodedStartPTS: start, lastDecodedEndPTS: end, playhead: playhead,
+    private func decide(_ last: Double?, _ playhead: Double,
+                        previous: Double? = nil) -> AudioTapPacing.Decision {
+        AudioTapPacing.decide(lastDecodedEndPTS: last, playhead: playhead, previousPlayhead: previous,
                               leadSeconds: 10, toleranceSeconds: 2)
     }
 
@@ -43,25 +40,41 @@ final class AudioTapPacingTests: XCTestCase {
     }
 
     func testPlayheadJumpedBackReanchors() {
-        // Backward seek: decoded position is far ahead of the new playhead.
-        XCTAssertEqual(decide(300.0, 100.0), .reanchor)
-        XCTAssertEqual(decide(113.5, 100.0), .reanchor)     // segment start > lead + tolerance
+        // Backward seek: the playhead itself moved back past the tolerance.
+        XCTAssertEqual(decide(300.0, 100.0, previous: 290.0), .reanchor)
+        XCTAssertEqual(decide(112.5, 100.0, previous: 102.5), .reanchor)
     }
 
-    func testALongSegmentDecodedWithinTheLeadIsNotABackwardJump() {
-        // A 10 s segment decoded while the lead had room: it starts within the lead and ends a
-        // whole segment past it. That is the lead full, not the playhead gone back.
-        XCTAssertEqual(decide(start: 109.5, end: 119.5, 100.0), .sleep)
-        XCTAssertEqual(decide(start: 104, end: 120, 100.0), .sleep, "a 16 s segment")
+    func testPlayheadBackWithinToleranceDoesNotReanchor() {
+        XCTAssertEqual(decide(105.0, 100.0, previous: 101.5), .decodeNext)
     }
 
-    func testALongSegmentStillReanchorsOnARealBackwardSeek() {
-        XCTAssertEqual(decide(start: 110, end: 120, 50.0), .reanchor)
-        XCTAssertEqual(decide(start: 112.5, end: 122.5, 100.0), .reanchor)
+    func testWholeSegmentOvershootSleepsInsteadOfReanchoring() {
+        // #864: a 15 s segment decoded at an unchanged playhead runs 24.9 s ahead. That is a
+        // normal overshoot, not a seek.
+        XCTAssertEqual(decide(120.0, 95.1, previous: 95.1), .sleep)
+        XCTAssertEqual(decide(300.0, 100.0, previous: 99.75), .sleep)
     }
 
-    func testWithoutASegmentStartOnlyTheEndIsJudged() {
-        XCTAssertEqual(decide(start: nil, end: 119.5, 100.0), .sleep)
-        XCTAssertEqual(decide(start: nil, end: 90.0, 100.0), .reanchor)
+    /// #864 follow-up (qoli's characterization): lead + tolerance bounds what is RELEASED ahead of
+    /// the playhead, not what is retained. A reader parked at 95 s with 15 s segments has decoded
+    /// 90-105 and 105-120: 12.1 s went to the stream and the other 14.9 s are still held, so the
+    /// decoded tail of the current segment comes on top of the released window.
+    func testHeldTailIsAdditionalToTheReleasedLead() {
+        func packet(_ index: Int) -> AudioTapBuffer {
+            let pcm = AVAudioPCMBuffer(pcmFormat: AetherEngine.audioTapFormat, frameCapacity: 4800)!
+            pcm.frameLength = 4800
+            return AudioTapBuffer(buffer: pcm, sourceTime: Double(index) / 10, discontinuity: false)
+        }
+        var held = AudioTapHeldBuffers()
+        var released = 0
+        for index in 900..<1050 { held.append(start: Double(index) / 10, buffer: packet(index)) }
+        _ = held.release(before: 105.05, droppingEndsBefore: 93.05) { _ in released += 1 }
+        for index in 1050..<1200 { held.append(start: Double(index) / 10, buffer: packet(index)) }
+        _ = held.release(before: 105.05, droppingEndsBefore: 93.05) { _ in released += 1 }
+        var stillHeld = 0
+        _ = held.release(before: .infinity, droppingEndsBefore: -.infinity) { _ in stillHeld += 1 }
+        XCTAssertEqual(released, 121)
+        XCTAssertEqual(stillHeld, 149)
     }
 }
