@@ -825,6 +825,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One still per served segment: the source's own keyframe at full resolution for SDR, and for HDR10, HLG and Dolby Vision a tone-mapped SDR Motion JPEG 640 pixels wide, since AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
     public var serveIFramePlaylist: Bool = false
 
+    /// Pre-generate the sparse scrub-still ladder while the source is idle. Default `true`.
+    /// Set to `false` when the host does not consume scrub previews to avoid this optional
+    /// side reader. Independent of `serveIFramePlaylist`, on-demand snapshots and item-swap
+    /// held pictures, including Dolby Vision compositor/reshaping. Correctable by reload.
+    public var generatesBackgroundScrubPreviews: Bool = true
+
     /// Confirm E-AC-3 JOC (Dolby Atmos) on this session's audio tracks, so `audioTracks` carries an honest
     /// `TrackInfo.isAtmos` for a badge instead of the pre-decode guess. No container reliably declares JOC, so
     /// this runs the same bounded decode pass as `AetherEngine.probeDetectingAtmos` (see `AtmosDetectionOptions`
@@ -1149,6 +1155,7 @@ public struct LoadOptions: Sendable, Equatable {
         prepareNativeSubtitles: Bool = false,
         eagerNativeSubtitleReaders: Bool = false,
         serveIFramePlaylist: Bool = false,
+        generatesBackgroundScrubPreviews: Bool = true,
         confirmAtmos: Bool = false,
         nativeSubtitlePreferredLanguages: [String] = [],
         sequentialOrigin: Bool = false,
@@ -1213,6 +1220,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.prepareNativeSubtitles = prepareNativeSubtitles
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
         self.serveIFramePlaylist = serveIFramePlaylist
+        self.generatesBackgroundScrubPreviews = generatesBackgroundScrubPreviews
         self.confirmAtmos = confirmAtmos
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
         self.sequentialOrigin = sequentialOrigin
@@ -1738,7 +1746,13 @@ public struct SubtitleImage: @unchecked Sendable {
     /// .zero when unknown (pre-canvas cues): hosts fall back to treating canvas == video.
     /// DVB reports the video frame here (AE#971): its display covers the whole picture, and a
     /// 720x576 plane on HD video has non-square pixels, so `position` is normalized against the
-    /// plane while this carries the shape to map onto.
+    /// plane while this carries the shape to map onto. DVD does the same on a rescaled encode
+    /// (AE#993, a 720x480 plane on 1280x720 video), and reports the 16:9 frame at the video's width
+    /// when the video is wider than 16:9 (cropped before scaling).
+    /// The size is in the video's CODED pixels. On anamorphic video (1440x1080, or 720x576 at 16:9)
+    /// the displayed picture is wider than the coded frame, so map the canvas onto the coded frame
+    /// first (width-aligned, center-anchored), then scale that rect onto the displayed picture rect
+    /// per axis. Mapping width-aligned onto the displayed rect directly makes the canvas too tall.
     public let canvasSize: CGSize
     /// AV_SUBTITLE_FLAG_FORCED from the decoded rect (#146): the disc authored this object as a
     /// forced caption (sign / foreign-dialogue overlay shown even with subtitles off).

@@ -1336,6 +1336,28 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return Self.itemRanges(durations: durations, residentIndexes: residentIndexes)
     }
 
+    /// AE#958: the segment covering playlist time `t` on a sequential session, from the muxed
+    /// durations. nil off the sequential path and past the finalized end, where the caller's plan
+    /// is the only estimate there is.
+    func sequentialSegmentIndex(forPlaylistTime t: Double) -> Int? {
+        guard sequentialAppendPlaylist else { return nil }
+        stateLock.lock()
+        let durations = _seqDurations
+        stateLock.unlock()
+        return Self.sequentialSegmentIndex(forPlaylistTime: t, durations: durations)
+    }
+
+    /// Zero-duration entries are plan indices a long GOP skipped; they hold no time and are never
+    /// the answer.
+    static func sequentialSegmentIndex(forPlaylistTime t: Double, durations: [Double]) -> Int? {
+        var cursor = 0.0
+        for (index, duration) in durations.enumerated() where duration > 0 {
+            cursor += duration
+            if max(t, 0) < cursor { return index }
+        }
+        return nil
+    }
+
     static func itemRanges(durations: [Double], residentIndexes: [ClosedRange<Int>]) -> [ClosedRange<Double>] {
         let resident = residentIndexes.reduce(into: IndexSet()) { set, range in
             set.insert(integersIn: range.lowerBound...range.upperBound)
@@ -3482,9 +3504,22 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // shape). AVKit fetches this VOD single-segment file ONCE and never re-fetches it, so it MUST be
             // complete. Wait for the reader's definitive EOF signal (isFinished) rather than a cue-count plateau
             // heuristic, which fired early during dialogue gaps and served a truncated file (device-confirmed).
-            let deadline = Date().addingTimeInterval(30.0)
-            while !store.isFinished, Date() < deadline {
-                usleep(100_000)
+            // AE#984: a load-declared sidecar's store is never waited on. Holding the request held AVPlayer's
+            // media loading with it, so a slow sidecar froze the picture; a 404 is retried every few seconds
+            // while A/V keeps loading, and a failed fill is answered at once. Reader-fed stores keep the wait.
+            switch store.wholeProgramServe {
+            case .retryLater:
+                EngineLog.emit("[HLSVideoEngine] AE#984: whole-program subtitle .vtt ord=\(ordinal) requested before "
+                               + "its sidecar is decoded; answering 404 so AVPlayer asks again", category: .hlsServer)
+                return nil
+            case .waitForReader:
+                let deadline = Date().addingTimeInterval(30.0)
+                while store.wholeProgramServe == .waitForReader, Date() < deadline {
+                    usleep(100_000)
+                }
+                if store.wholeProgramServe == .retryLater { return nil }
+            case .complete, .failedFill:
+                break
             }
             // Sodalite#32: the cues are stored at SOURCE pts; AVPlayer clock = source - shift. Apply the CURRENT
             // engine shift (read now, not the possibly-zero load-time value) so cues land on the video's axis.

@@ -216,6 +216,7 @@ Routes the host did not ask for:
 | `.remoteBypass` -> `.loopback` | #168 carriage watchdog: readyToPlay, but no video track for a master that advertises one (HEVC in MPEG-TS). Mid-session. |
 | `.remoteBypass` -> `.loopback` | #199: the same master's verdict is remembered, so the next load skips the doomed mount entirely. At load time. |
 | `.remoteBypass` -> `.loopback` | AE#268: the playlist plus the first segment's PMT identify a finite HEVC-in-MPEG-TS VOD. At load time. |
+| `.remoteBypass` -> `.software` | AE#990: a finite MPEG-TS playlist with `preferredDecodePath = .software`, at load time, or one AVPlayer refused on its media, through the AE#561 rebuild. |
 | `.loopback` -> `.remoteBypass` | AE#154 / AE#246: an HLS playlist reached the loopback path, which cannot demux it. At load time. |
 
 Branch on this where host behaviour differs per pipeline: who draws subtitles (AVPlayer on the bypass, the host's renderer on loopback and software), and whether a composited PiP overlay is meaningful at all. Observing it also makes the mid-session reroute an event rather than a log line.
@@ -505,6 +506,12 @@ Sources/AetherEngine/
 │   │   ├── AudioShapingMatrix.swift         The cap and the centre lift as one libswresample remix matrix
 │   │   └── AudioShapingGraph.swift          The libavfilter graph after the remix: dialoguenhance + pan on stereo, acompressor, alimiter, aformat; runs on its own sample counter so its latency never reaches the timeline
 │   ├── Spatial/
+│   │   ├── SpatialAudioBridge.swift         TrueHD Atmos / DTS:X packets in, the layout's bed out as APAC or PCM packets on the source timeline (optional components)
+│   │   ├── BedRegression.swift              Every output built from the stream's own bed, per band, steered by the elements' cross-spectra; never an element signal (W = R · A, DTS:X folds W = D + (R − D · F) · A)
+│   │   ├── ObjectAudioPlacement.swift       Each element's gains towards the layout from its metadata, point sources, no ramps; mixes no audio
+│   │   ├── AllocentricPanner.swift          Constant-power point-source gains in the allocentric room model, TS 103 448 speaker targets
+│   │   ├── TrueHDObjectAudioDecoder.swift   LibTrueHD: the channel presentation plus the object presentation without matrix interpolation
+│   │   ├── DTSXObjectAudioDecoder.swift     FFmpeg `dca` with `x_heights`: the 7.1 bed as coded plus the four heights and their folds
 │   │   ├── SpatialBedOutput.swift           `SpatialBedFormat` (PCM or APAC, and the route rule `.render` uses), the bed buffers and packets, and `PCMBedPacker`, the 24-bit PCM sink beside `APACEncodePipeline`
 │   │   └── SoftwareAPACProducer.swift       SW path: TrueHD Atmos / DTS:X rendered into a speaker bed through `SpatialAudioBridge` as APAC or PCM, the packets handed to the audio renderer as sample buffers
 │   └── Tap/
@@ -537,6 +544,7 @@ Sources/AetherEngine/
 │   ├── AV1FilmGrain.swift                   The per-frame grain tables (templates, scaling functions, block offsets), computed on the CPU as dav1d computes them
 │   ├── AV1FilmGrainShaderSource.swift       The Metal kernels: dav1d's per-pixel grain and the P010 write
 │   ├── AV1GaussianSequence.swift            AV1's Gaussian_Sequence (specification 7.18.3.3)
+│   ├── SidecarTextFetch.swift               One plain whole-body GET for a text sidecar over HTTP, decoded from a temporary file, instead of the playback reader's ranged open and its 15 s + 25 s give-up (AE#984)
 │   ├── SubtitleDecoder.swift                Sidecar URL one-shot decode; decodes several streams of one container in a single pass (#266); a bitmap stream is read into packets instead (#921)
 │   ├── VideoDecoderTypes.swift              DecodedFrameHandler typealias + VideoDecoderError
 │   ├── DeinterlaceHardwareWarmup.swift      Demand-driven process-wide prewarm of the deinterlace filter's hardware pipeline; only potentially interlaced `.auto` loads start and await it. Progressive sources and forced-software deinterlace skip it. Same-title reloads preserve even a decoded progressive verdict; the background selection snapshot retains that decision for a custom-reader reopen, while URL reloads probe afresh. Actual disc-title changes re-evaluate reopened metadata. A source declared progressive that later supplies interlaced frames still deinterlaces on demand, paying the cold graph build at that first frame
@@ -642,7 +650,8 @@ Sources/AetherEngine/
 │   ├── SoftwareNowPlaying.swift             Software-host Now-Playing: state-to-card mapping, remote-command routing and the publisher, behind small protocols for the two process-wide centers so tests run on fakes; undoes only its own changes at stop
 │   └── StartupReadinessGate.swift           Outcome of one startup-readiness attempt: the reloaded item reached a playable state, died, or ran out the settle window without doing either
 ├── Network/
-│   └── HLSLocalServer.swift                 Native path: local HTTP server (all interfaces for AirPlay, every path behind a per-session token, loopback URLs handed to the local player) serving playlist + segments. It writes the master, so the audio rendition's attributes are decided here: `EXT-X-MEDIA:TYPE=AUDIO` carries `LANGUAGE` (AE#458) and `CHANNELS`, the latter answered by the segment provider (`"16/JOC"` for a stream-copied E-AC-3 JOC track, the served bed count otherwise) and omitted entirely when the provider has no rendition to attribute. An untagged track has no rendition unless it is a stream-copied JOC one, which gets one without `LANGUAGE` for the sake of its `CHANNELS` (AE#726)
+│   ├── HLSLocalServer.swift                 Native path: local HTTP server (all interfaces for AirPlay, every path behind a per-session token, loopback URLs handed to the local player) serving playlist + segments. It writes the master, so the audio rendition's attributes are decided here: `EXT-X-MEDIA:TYPE=AUDIO` carries `LANGUAGE` (AE#458) and `CHANNELS`, the latter answered by the segment provider (`"16/JOC"` for a stream-copied E-AC-3 JOC track, the served bed count otherwise) and omitted entirely when the provider has no rendition to attribute. An untagged track has no rendition unless it is a stream-copied JOC one, which gets one without `LANGUAGE` for the sake of its `CHANNELS` (AE#726)
+│   └── URLRequest+ContentSniffing.swift     `URLRequest(engineURL:)`, the one way the engine builds an origin request: it turns CFNetwork's content sniffing off, which otherwise withholds a `text/plain` or untyped response, refusals included, until 512 body bytes or the end of the connection (AE#986)
 ├── Renderer/
 │   ├── SampleBufferRenderer.swift           SW path: AVSampleBufferDisplayLayer + B-frame reorder, HDR10+ attachments; `flush(removingDisplayedImage:)` holds the last frame through a seek (#90); the decode thread reaches the layer only through its `sampleBufferRenderer`, taken once on the main actor (#351)
 │   └── SubtitleFrameCompositor.swift        Composites active cues into decoded software-path frames while PiP is active, since the system PiP window renders only the sample-buffer layer; playback wins, every failure path returns the original buffer untouched

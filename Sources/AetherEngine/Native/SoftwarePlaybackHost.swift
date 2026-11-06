@@ -23,6 +23,9 @@ final class SoftwarePlaybackHost {
     nonisolated static func presentationReorderDepth(codecID: UInt32) -> Int? {
         switch codecID {
         case AV_CODEC_ID_H264.rawValue, AV_CODEC_ID_HEVC.rawValue, AV_CODEC_ID_VC1.rawValue: return 32
+        // WMV1/2 decode only I/P pictures (FFmpeg msmpeg4dec.c / wmv2dec.c): no B reorder.
+        // Still hold one successor; never invent the last picture's presentation duration.
+        case AV_CODEC_ID_WMV1.rawValue, AV_CODEC_ID_WMV2.rawValue: return 1
         default: return nil
         }
     }
@@ -1039,7 +1042,7 @@ final class SoftwarePlaybackHost {
         switch route {
         case .pcm: return .decoded
         case .compressedEAC3JOC: return .streamCopy
-        case .apac, .pcmBed: return .bridged
+        case .apac, .pcmBed, .decodedEAC3JOC: return .bridged
         }
     }
 
@@ -1207,7 +1210,8 @@ final class SoftwarePlaybackHost {
         #if !targetEnvironment(simulator)
         if #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *) {
             let interval = frameRate.flatMap { $0.isFinite && $0 > 0 ? 1 / $0 : nil } ?? 1.0 / 25
-            guard let stage = FrameUpscaler(plan: plan, frameInterval: interval) else { return handler }
+            guard let stage = FrameUpscaler(plan: plan, frameInterval: interval, buildQueue: FrameUpscaler.stageBuildQueue)
+            else { return handler }
             frameUpscaler = stage
             return UpscalingFrameHandler.wrap(handler) { stage.upscale($0, pts: $1) }
         }
@@ -1736,7 +1740,7 @@ final class SoftwarePlaybackHost {
 
     /// Waits for the registration on the route that needs it and never on any other.
     static func awaitAtmosPrimer(for route: SoftwareAtmosRoute, wait: @MainActor () async -> Void) async {
-        guard route == .compressedEAC3JOC else { return }
+        guard route.needsAtmosDecoder else { return }
         await wait()
     }
 
@@ -1768,13 +1772,7 @@ final class SoftwarePlaybackHost {
         case .none:
             break
         }
-        if !demuxLoopStarted, let aOut = audioOutput {
-            aOut.attachVideoLayer(renderer.displayLayer)
-        }
-        if !demuxLoopStarted {
-            demuxLoopStarted = true
-            startDemuxLoop()
-        }
+        startLoopsIfNeeded()
         // Cold start: demux loop arms the clock on first decoded audio sample; don't eager-start.
         rate = lastRate
         isPlaying = true
@@ -1897,16 +1895,28 @@ final class SoftwarePlaybackHost {
         audioOutput?.setPlaybackEnabled(false)
         pausedByHost = true
         rate = 0
-        if PausedFirstFrame.holdsForFirstFrame(loopsStarted: demuxLoopStarted, framesEnqueued: framesEnqueued),
+        let startsLoops = PausedFirstFrame.startsLoopsForFirstFrame(
+            loaded: isReady && failure == nil, loopsStarted: demuxLoopStarted)
+        if PausedFirstFrame.holdsForFirstFrame(loopsStarted: demuxLoopStarted, framesEnqueued: framesEnqueued)
+            || startsLoops,
            !stopRequested {
             pausedBeforeFirstFrame = true
             EngineLog.emit(
-                "[SWHost] #104 paused before the first frame: the loops keep reading at a stopped clock until it presents",
+                "[SWHost] #104 paused before the first frame: the loops keep reading at a stopped clock until it presents"
+                + (startsLoops ? " (AE#973: started for it, nothing had played this host)" : ""),
                 category: .swPlayback
             )
         }
         isPlaying = false
         inFlightSeekResumeIntent = false
+        if startsLoops, !stopRequested { startLoopsIfNeeded() }
+    }
+
+    private func startLoopsIfNeeded() {
+        guard !demuxLoopStarted else { return }
+        audioOutput?.attachVideoLayer(renderer.displayLayer)
+        demuxLoopStarted = true
+        startDemuxLoop()
     }
 
     /// Sodalite#104 round 4: the first frame of a session paused before it is in. Moves the stopped clock
@@ -3171,9 +3181,7 @@ final class SoftwarePlaybackHost {
         var prevRawVideoPtsSec = Double.nan
         var frameIntervalSec = 0.0
         var discontinuityOffsetSec = 0.0
-        var loggedSWDiscontinuities = 0
-        var holeFold = LiveHoleFold()
-        var audioAxis = LiveAudioAxis()
+        var loggedSWDiscontinuity = false
         var lastSeenExtradata: Data? = nil
         let replayReader = LiveReplayPacketReader(videoIndex: videoStreamIndex, audioIndex: audioStreamIndex,
             videoTimeBase: videoTimeBaseSeconds, audioTimeBase: audioTimeBaseSeconds)
@@ -3258,31 +3266,18 @@ final class SoftwarePlaybackHost {
                 packet.pointee.pts = packet.pointee.dts
             }
 
-            // Audio on another axis than the video joins it before anything reads its timestamps.
-            if !applyLiveAudioAxis(&audioAxis, to: packet, videoIndex: videoStreamIndex, audioIndex: audioStreamIndex,
-                                   videoTimeBase: videoTimeBaseSeconds, audioTimeBase: audioTimeBaseSeconds) {
-                av_packet_unref(packet)
-                av_packet_free_safe(packet)
-                return true
-            }
-
             // Live PTS-discontinuity: same accrual as combined loop.
             if streamIdx == videoStreamIndex, videoTimeBaseSeconds > 0,
                packet.pointee.pts != Int64.min {
                 let rawPtsSec = Double(packet.pointee.pts) * videoTimeBaseSeconds
                 if !prevRawVideoPtsSec.isNaN {
                     let deltaSec = rawPtsSec - prevRawVideoPtsSec
-                    if abs(deltaSec) >= discontinuityThresholdSeconds
-                        || holeFold.opensHole(videoSeconds: rawPtsSec) {
+                    if abs(deltaSec) >= discontinuityThresholdSeconds {
                         let expectedContinuation = prevRawVideoPtsSec
                             + (frameIntervalSec > 0 ? frameIntervalSec : 0)
-                        if deltaSec > 0 {
-                            holeFold.noteFold(fromVideoSeconds: prevRawVideoPtsSec, toVideoSeconds: rawPtsSec,
-                                              foldBefore: discontinuityOffsetSec)
-                        }
                         discontinuityOffsetSec += (rawPtsSec - expectedContinuation)
-                        if loggedSWDiscontinuities < 20 {
-                            loggedSWDiscontinuities += 1
+                        if !loggedSWDiscontinuity {
+                            loggedSWDiscontinuity = true
                             EngineLog.emit(
                                 "[SWHost] live PTS discontinuity (reader): prevPts="
                                 + "\(String(format: "%.2f", prevRawVideoPtsSec))s "
@@ -3298,27 +3293,14 @@ final class SoftwarePlaybackHost {
                     }
                 }
                 prevRawVideoPtsSec = rawPtsSec
-                holeFold.noteVideo(seconds: rawPtsSec)
             }
-            var packetFoldSeconds = discontinuityOffsetSec
-            if streamIdx == audioStreamIndex, audioTimeBaseSeconds > 0, packet.pointee.pts != Int64.min {
-                switch holeFold.audio(seconds: Double(packet.pointee.pts) * audioTimeBaseSeconds,
-                                      currentFoldSeconds: discontinuityOffsetSec) {
-                case .drop:
-                    av_packet_unref(packet)
-                    av_packet_free_safe(packet)
-                    return true
-                case .play(let foldSeconds):
-                    packetFoldSeconds = foldSeconds
-                }
-            }
-            if packetFoldSeconds != 0 {
+            if discontinuityOffsetSec != 0 {
                 let tbSec = (streamIdx == videoStreamIndex)
                     ? videoTimeBaseSeconds : audioTimeBaseSeconds
                 if tbSec > 0 {
                     // Audit NAT-101: the offset spans twice the input range and converts per stream
                     // base, so a packet on the far side of a seam can still leave Int64.
-                    let offsetTicks = SourceTimestampBounds.roundedTicks(packetFoldSeconds / tbSec)
+                    let offsetTicks = SourceTimestampBounds.roundedTicks(discontinuityOffsetSec / tbSec)
                     packet.pointee.pts = SourceTimestampBounds.shifted(packet.pointee.pts, back: offsetTicks)
                     packet.pointee.dts = SourceTimestampBounds.shifted(packet.pointee.dts, back: offsetTicks)
                 }
@@ -3363,34 +3345,6 @@ final class SoftwarePlaybackHost {
                 readerIteration()
             }
             if !keepGoing { break }
-        }
-    }
-
-    /// Moves a live audio packet onto the video's axis (`LiveAudioAxis`). False when it is to be dropped.
-    nonisolated private static func applyLiveAudioAxis(
-        _ axis: inout LiveAudioAxis,
-        to packet: UnsafeMutablePointer<AVPacket>,
-        videoIndex: Int32,
-        audioIndex: Int32,
-        videoTimeBase: Double,
-        audioTimeBase: Double
-    ) -> Bool {
-        guard videoIndex >= 0, audioIndex >= 0, packet.pointee.pts != Int64.min else { return true }
-        if packet.pointee.stream_index == videoIndex {
-            if videoTimeBase > 0 { axis.noteVideo(ptsSeconds: Double(packet.pointee.pts) * videoTimeBase) }
-            return true
-        }
-        guard packet.pointee.stream_index == audioIndex, audioTimeBase > 0 else { return true }
-        switch axis.audio(ptsSeconds: Double(packet.pointee.pts) * audioTimeBase) {
-        case .drop:
-            return false
-        case .play(let shiftSeconds):
-            if shiftSeconds != 0 {
-                let ticks = SourceTimestampBounds.roundedTicks(shiftSeconds / audioTimeBase)
-                packet.pointee.pts = SourceTimestampBounds.shifted(packet.pointee.pts, back: ticks)
-                packet.pointee.dts = SourceTimestampBounds.shifted(packet.pointee.dts, back: ticks)
-            }
-            return true
         }
     }
 
@@ -3951,7 +3905,6 @@ final class SoftwarePlaybackHost {
         var frameIntervalSec = 0.0
         var discontinuityOffsetSec = 0.0
         var loggedSeamCount = 0
-        var audioAxis = LiveAudioAxis()
         let replayReader = isLive && directLiveSource == nil ? LiveReplayPacketReader(videoIndex: videoStreamIndex,
             audioIndex: audioStreamIndex, videoTimeBase: videoTimeBaseSeconds,
             audioTimeBase: audioTimeBaseSeconds) : nil
@@ -4386,14 +4339,6 @@ final class SoftwarePlaybackHost {
             recordingTap(packet)
 
             let streamIdx = packet.pointee.stream_index
-
-            // Audio on another axis than the video joins it before anything reads its timestamps.
-            if isLive, !applyLiveAudioAxis(&audioAxis, to: packet, videoIndex: videoStreamIndex, audioIndex: audioStreamIndex,
-                                           videoTimeBase: videoTimeBaseSeconds, audioTimeBase: audioTimeBaseSeconds) {
-                av_packet_unref(packet)
-                av_packet_free_safe(packet)
-                return true
-            }
 
             // Discontinuity runs before any timestamp read; offset applied to both streams.
             if foldTimeline, streamIdx == videoStreamIndex, videoTimeBaseSeconds > 0,
