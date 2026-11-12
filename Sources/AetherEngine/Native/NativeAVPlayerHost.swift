@@ -2,7 +2,7 @@ import Foundation
 import AVFoundation
 import AVKit
 import Combine
-#if os(tvOS) || os(iOS)
+#if os(iOS) || os(tvOS) || os(visionOS)
 import MediaPlayer
 #endif
 #if os(iOS) || os(tvOS) || os(visionOS)
@@ -378,7 +378,7 @@ final class NativeAVPlayerHost {
 
     // MARK: - Init
 
-    #if os(tvOS) || os(iOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     /// Now-Playing session bound to THIS player (same rationale as
     /// AudioAVPlayerHost): the shared MPRemoteCommandCenter /
     /// MPNowPlayingInfoCenter aren't reliably bound to a bare AVPlayer, a
@@ -422,7 +422,7 @@ final class NativeAVPlayerHost {
         self.playerLayer = AVPlayerLayer(player: player)
         self.playerLayer.videoGravity = .resizeAspect
         self.ownsNowPlayingSession = ownsNowPlayingSession
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         if ownsNowPlayingSession {
             let session = MPNowPlayingSession(players: [player])
             session.automaticallyPublishesNowPlayingInfo = true
@@ -437,7 +437,7 @@ final class NativeAVPlayerHost {
     /// another engine path) took over in the meantime is never claimed back. No-op when no session
     /// is owned.
     func becomeActiveNowPlaying() {
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         nowPlayingSession?.becomeActiveIfPossible(completion: { _ in })
         #endif
     }
@@ -447,7 +447,7 @@ final class NativeAVPlayerHost {
     /// elapsed/rate/duration. Empty clears.
     func setNowPlayingInfo(_ info: [String: Any]) {
         pendingNowPlayingInfo = info
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         // Only when this host owns the session. Writing item.nowPlayingInfo under an AVKit host
         // would feed AVKit's own Now-Playing publication a second, host-authored identity.
         guard ownsNowPlayingSession else { return }
@@ -614,9 +614,9 @@ final class NativeAVPlayerHost {
             category: .engine
         )
         layerReadyObservation = playerLayer.observe(
-            \.isReadyForDisplay, options: [.new]
-        ) { [weak self] layer, change in
-            let ready = change.newValue ?? layer.isReadyForDisplay
+            \.isReadyForDisplay, options: []
+        ) { [weak self] layer, _ in
+            let ready = layer.isReadyForDisplay
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - loadStart.uptimeNanoseconds) / 1_000_000_000
             EngineLog.emit(
                 "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(ready) t+\(String(format: "%.2f", elapsed))s",
@@ -644,7 +644,7 @@ final class NativeAVPlayerHost {
             item.automaticallyPreservesTimeOffsetFromLive = true
             // The origin's HOLD-BACK is only known once its playlist is read, and a shallower cushion
             // would otherwise move the playhead closer than it (AE#189's stall-danger zone).
-            liveOffsetFloorObservation = item.observe(\.recommendedTimeOffsetFromLive, options: [.initial, .new]) {
+            liveOffsetFloorObservation = item.observe(\.recommendedTimeOffsetFromLive, options: [.initial]) {
                 [weak self] item, _ in
                 let recommended = item.recommendedTimeOffsetFromLive.seconds
                 Task { @MainActor in
@@ -665,7 +665,7 @@ final class NativeAVPlayerHost {
             item.externalMetadata = pendingExternalMetadata
         }
         #endif
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         // Replay staged Now-Playing identity onto the fresh item (gate
         // reloads / media fallback / in-place swaps keep the system card).
         // Owned sessions only: see setNowPlayingInfo.
@@ -708,7 +708,7 @@ final class NativeAVPlayerHost {
         // #134: mirror seekableTimeRanges instead of reading it per call. The callback runs on
         // the item's queue where the re-read is a harmless off-main XPC; live playlist refreshes
         // keep it current, including while paused.
-        seekableObservation = item.observe(\.seekableTimeRanges, options: [.initial, .new]) { [weak self] item, _ in
+        seekableObservation = item.observe(\.seekableTimeRanges, options: [.initial]) { [weak self] item, _ in
             let end = Self.seekableEnd(from: item.seekableTimeRanges)
             let start = Self.seekableStart(from: item.seekableTimeRanges)
             Task { @MainActor in
@@ -723,8 +723,8 @@ final class NativeAVPlayerHost {
         }
 
         // Observe on the item's queue; do not poll a potentially wedged media server on main.
-        loadedVideoObservation = item.observe(\.loadedTimeRanges, options: [.initial, .new]) { [weak self] item, change in
-            let ranges = (change.newValue ?? item.loadedTimeRanges).map { value in
+        loadedVideoObservation = item.observe(\.loadedTimeRanges, options: [.initial]) { [weak self] item, _ in
+            let ranges = item.loadedTimeRanges.map { value in
                 let r = value.timeRangeValue
                 return (r.start.seconds, (r.start + r.duration).seconds)
             }
@@ -735,7 +735,7 @@ final class NativeAVPlayerHost {
         }
 
         // KVO fires on AVPlayerItem's queue; Task round-trips to MainActor.
-        statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        statusObservation = item.observe(\.status, options: []) { [weak self] item, _ in
             let statusStr: String
             switch item.status {
             case .unknown:     statusStr = "unknown"
@@ -813,7 +813,7 @@ final class NativeAVPlayerHost {
             }
         }
 
-        rateObservation = avPlayer.observe(\.rate, options: [.new]) { [weak self] player, _ in
+        rateObservation = avPlayer.observe(\.rate, options: []) { [weak self] player, _ in
             let rate = player.rate
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) rate=\(rate)", category: .engine)
             Task { @MainActor in
@@ -826,7 +826,7 @@ final class NativeAVPlayerHost {
         // AE#440: the reason moves inside a single `waitingToPlayAtSpecifiedRate` stretch, so this is a
         // separate edge from the one below. It carries no diagnostics and no state: the lever logs its
         // own outcome, and everything else here keys on the status.
-        waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: [.new]) { [weak self] player, _ in
+        waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: []) { [weak self] player, _ in
             let reason = player.reasonForWaitingToPlay?.rawValue
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
@@ -834,7 +834,7 @@ final class NativeAVPlayerHost {
                 if let reason { self.startLiveJoinImmediatelyIfHolding(waitingReason: reason) }
             }
         }
-        timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+        timeControlObservation = avPlayer.observe(\.timeControlStatus, options: []) { [weak self] player, _ in
             let status = player.timeControlStatus
             let statusStr: String
             switch status {

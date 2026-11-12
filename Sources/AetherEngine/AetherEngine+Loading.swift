@@ -101,8 +101,9 @@ extension AetherEngine {
 
     /// Wire `$duration`, `$isReady`, `$failure`, `$didReachEnd` into the cancellable set.
     /// `isReady` always feeds the public `isSessionReady` mirror and replays a deferred pre-ready host
-    /// seek (#127); pass `settlePausedAtReadiness: false` for paths that skip the readiness -> .paused
-    /// waypoint (autostarting loadRemoteHLS, where the terminal play() runs and readiness is a waypoint).
+    /// seek (#127). `settlePausedAtReadiness` comes from `readinessSettlesPaused(autostarts:)` on every
+    /// video path: an autostarting load skips the readiness -> .paused waypoint, because its terminal
+    /// play() still runs after the post-load play gate (AE#1000).
     /// #315: fold a host's raw `isVideoReadyForDisplay` level into the load-scoped public latch.
     ///
     /// Two operators carry the whole contract. `dropFirst()` discards the value the publisher
@@ -188,7 +189,7 @@ extension AetherEngine {
     /// `videoReadyForDisplay` is the host's raw layer level (#315); nil on the audio hosts, which
     /// have nothing to display. It is folded, never mirrored: the engine's published flag is latched
     /// for the load, so the seams that reuse a host and briefly lose the picture do not surface.
-    private func wireCommonHostSinks(
+    func wireCommonHostSinks(
         duration: Published<Double>.Publisher,
         isReady: Published<Bool>.Publisher,
         settlePausedAtReadiness: Bool = true,
@@ -223,6 +224,13 @@ extension AetherEngine {
                 // `liveItemPlacementPending`.
                 if ready {
                     self.noteLiveItemStart()
+                    // AE#1018: an HDR master reaching readyToPlay was accepted, and a display presenting SDR
+                    // refuses one at parse time (AE#459), so the panel presents HDR. The load-time readout
+                    // is taken mid-switch and reads 1.00 on exactly the panels this has to recognise.
+                    if let session = self.nativeVideoSession, session.servingMasterPlaylist,
+                       session.servedSourceIsHDR, !self.masterFallbackUsed {
+                        session.notePanelPresentsHDR(true)
+                    }
                     // The placement is spent here, on every path rather than only on the one that
                     // replays the stashed seek: a pre-ready seek can be superseded by a host scrub
                     // (latest-wins), and an arm left standing would be inherited by whatever item the
@@ -327,7 +335,7 @@ extension AetherEngine {
     /// a host preserved across a native->native reload (issue #15) keeps what it was created with,
     /// which is the point, since re-creating it is what breaks AVKit's MediaRemote registration.
     func makeNativeHost() -> NativeAVPlayerHost {
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         let host = NativeAVPlayerHost(ownsNowPlayingSession: Self.ownsNowPlaying(
             hostOptIn: ownsVideoNowPlayingSession, role: loadedOptions.sharedOutputRole))
         #else
@@ -352,17 +360,21 @@ extension AetherEngine {
         return host
     }
 
-    /// Replay the staged Now-Playing identity onto a host, and re-assert session ownership. The
-    /// re-assert mirrors the audio path: a preserved host never re-runs init, so a session another
-    /// app took over in the meantime would otherwise never be claimed back. Both no-op for a host
-    /// that owns no session.
+    /// Replay the staged Now-Playing identity onto a host, re-assert session ownership, and start the
+    /// engine's publisher for the route. The re-assert mirrors the audio path: a preserved host never
+    /// re-runs init, so a session another app took over in the meantime would otherwise never be
+    /// claimed back. The first two no-op for a host that owns no session.
     func replayVideoNowPlayingInfo(to host: NativeAVPlayerHost) {
-        #if os(tvOS) || os(iOS)
-        guard host.ownsNowPlayingSession else { return }
-        if !pendingVideoNowPlayingInfo.isEmpty {
-            host.setNowPlayingInfo(pendingVideoNowPlayingInfo)
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        if host.ownsNowPlayingSession {
+            if !pendingVideoNowPlayingInfo.isEmpty {
+                host.setNowPlayingInfo(pendingVideoNowPlayingInfo)
+            }
+            host.becomeActiveNowPlaying()
         }
-        host.becomeActiveNowPlaying()
+        startNowPlayingPublisher(.nativeVideo, sessionCenter: host.nowPlayingSession?.remoteCommandCenter)
+        #else
+        startNowPlayingPublisher(.nativeVideo, sessionCenter: nil)
         #endif
     }
 
@@ -536,7 +548,7 @@ extension AetherEngine {
         wireCommonHostSinks(
             duration: host.$duration,
             isReady: host.$isReady,
-            settlePausedAtReadiness: !Self.loadPerformsAutostart(options),
+            settlePausedAtReadiness: Self.readinessSettlesPaused(autostarts: Self.loadPerformsAutostart(options)),
             failure: host.$failure,
             didReachEnd: host.$didReachEnd,
             videoReadyForDisplay: host.$isVideoReadyForDisplay,
@@ -833,6 +845,7 @@ extension AetherEngine {
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         dolbyVisionRPUProfile: Int? = nil,
+        measuredFrameRate: AVRational? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         sessionDisplayCaps: DisplayCapabilities,
@@ -842,8 +855,10 @@ extension AetherEngine {
         liveRejoin: Bool = false,
         preopenedDemuxer: Demuxer? = nil,
         keepsMediaPlaylistRoute: Bool = false,
+        autostarts: Bool,
         generation: UInt64,
-        resolvePanelRouting: (() async throws -> Bool)? = nil
+        resolvePanelRouting: (() async throws -> Bool)? = nil,
+        panelPresentsHDR: Bool = false
     ) async throws {
         // companionAudioReader is set by the reader's resolver before any main-stream byte flows, so it is
         // final by the time loadNative runs; nil means muxed audio.
@@ -909,12 +924,15 @@ extension AetherEngine {
             forceDolbyVisionOnNonDVDisplay: forceDolbyVisionOnNonDVDisplay,
             dolbyVisionHandling: dolbyVisionHandling,
             dolbyVisionRPUProfile: dolbyVisionRPUProfile,
+            measuredFrameRate: measuredFrameRate,
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
             undecodableAudioStreamIndices: undecodableLiveAudioStreamIndices,
             audioBridgeMode: audioBridgeMode,
             objectAudioRendering: loadedOptions.objectAudioRendering,
+            foldsDolbyVisionFEL: loadedOptions.foldsDolbyVisionFEL,
+            panelPresentsHDR: panelPresentsHDR,
             stereoPresentation: loadedOptions.stereoPresentation,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
@@ -1348,6 +1366,10 @@ extension AetherEngine {
             let routesAsHDRPanel: Bool
             do {
                 routesAsHDRPanel = try await resolvePanelRouting()
+                if Self.sessionPanelPresentsHDR(hostAsserts: loadedOptions.panelIsInHDRMode,
+                                                criteriaReadout: sessionPanelHDRReadout) {
+                    session.notePanelPresentsHDR(true)
+                }
             } catch {
                 session.stop(reason: .loadFailed)
                 throw error
@@ -1563,6 +1585,7 @@ extension AetherEngine {
         wireCommonHostSinks(
             duration: host.$duration,
             isReady: host.$isReady,
+            settlePausedAtReadiness: Self.readinessSettlesPaused(autostarts: autostarts),
             failure: host.$failure,
             didReachEnd: host.$didReachEnd,
             videoReadyForDisplay: host.$isVideoReadyForDisplay,
@@ -2018,6 +2041,7 @@ extension AetherEngine {
         dvrWindowSeconds: Double? = nil,
         preopenedDemuxer: Demuxer?,
         requiresDeinterlaceWarmup: Bool,
+        autostarts: Bool,
         generation: UInt64,
         elType: String? = nil
     ) async throws {
@@ -2221,6 +2245,7 @@ extension AetherEngine {
         wireCommonHostSinks(
             duration: host.$duration,
             isReady: host.$isReady,
+            settlePausedAtReadiness: Self.readinessSettlesPaused(autostarts: autostarts),
             failure: host.$failure,
             didReachEnd: host.$didReachEnd,
             videoReadyForDisplay: host.$isVideoReadyForDisplay,
@@ -2245,6 +2270,7 @@ extension AetherEngine {
         let sessionCacheByteBudget = loadedOptions.sessionCacheByteBudget
         let packetCacheStorage = loadedOptions.softwarePacketCacheStorage
         let dvrRetention = loadedOptions.softwareDVRRetention
+        let liveDVRByteBudget = loadedOptions.liveDVRByteBudget
         try await BlockingWork.detached(priority: .userInitiated) {
             [host, preopenedDemuxer, url, sourceHTTPHeaders, requestHeaders = sessionRequestHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
@@ -2262,6 +2288,7 @@ extension AetherEngine {
                 isLive: isLive,
                 dvrWindowSeconds: dvrWindowSeconds,
                 dvrRetention: dvrRetention,
+                liveDVRByteBudget: liveDVRByteBudget,
                 forwardBufferSegments: forwardBufferSegments,
                 packetCacheStorage: packetCacheStorage,
                 sessionCacheByteBudget: sessionCacheByteBudget
@@ -2295,6 +2322,7 @@ extension AetherEngine {
         let host = AudioPlaybackHost()
         host.audioShaping = loadedOptions.audioShaping
         self.audioHost = host
+        startNowPlayingPublisher(.audioFFmpeg, sessionCenter: nil)
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
         self.playlistShiftSeconds = 0
@@ -2383,8 +2411,11 @@ extension AetherEngine {
         // so the Home badge + remote commands stay bound across a pause.
         host.becomeActiveNowPlaying()
         host.setExternalMetadata(pendingExternalMetadata)
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         host.setNowPlayingInfo(pendingAudioNowPlayingInfo)
+        startNowPlayingPublisher(.audioAVPlayer, sessionCenter: host.nowPlayingSession.remoteCommandCenter)
+        #else
+        startNowPlayingPublisher(.audioAVPlayer, sessionCenter: nil)
         #endif
 
         audioNativeCancellables.removeAll()
@@ -2773,6 +2804,7 @@ extension AetherEngine {
                     dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
                     preopenedDemuxer: customPreopened,
                     requiresDeinterlaceWarmup: reopenedRequiresDeinterlaceWarmup,
+                    autostarts: transportIntentUnderReconstruction ?? resumesPlaying,
                     generation: gen,
                     elType: sourceElType
                 )
@@ -2844,6 +2876,7 @@ extension AetherEngine {
                     // AE#532: the verdict the load reached, not a second audit: the source has not
                     // changed and the probe that could answer it is gone.
                     dolbyVisionRPUProfile: sourceDolbyVisionRPUProfile,
+                    measuredFrameRate: sourceMeasuredFrameRate,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
                     panelIsInHDRMode: reloadRoutingPanelHDR,
                     // AE#535: the load's table, for the same reason as the panel answer above.
@@ -2856,7 +2889,14 @@ extension AetherEngine {
                     liveRejoin: loadedOptions.isLive,
                     preopenedDemuxer: customPreopened,
                     keepsMediaPlaylistRoute: keepsMediaRoute,
-                    generation: gen
+                    autostarts: transportIntentUnderReconstruction ?? resumesPlaying,
+                    generation: gen,
+                    panelPresentsHDR: Self.felGatePanelPresentsHDR(
+                        labelPresentsHDR: Self.sessionPanelPresentsHDR(
+                            hostAsserts: loadedOptions.panelIsInHDRMode, criteriaReadout: sessionPanelHDRReadout),
+                        hdrWriteEngagesPanel: displayCriteria.hdrWriteExpectedToEngagePanel(),
+                        engineWritesHDRCriteria: loadedOptions.engineWritesDisplayCriteria && videoFormat != .sdr,
+                        panelRefusedHDRMaster: Self.panelRefusedHDRMaster || masterFallbackUsed)
                 )
                 EngineLog.emit("[AetherEngine] reload: loadNative done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .native
@@ -2872,16 +2912,18 @@ extension AetherEngine {
                 // #274: this reload preserved the criteria (resetDisplayCriteria: false) and re-applies none,
                 // so only a sole-writer host's re-write on the swapped item can still switch anything; the
                 // published (panel-clamped) format decides whether that can be a dynamic-range switch.
-                await displayCriteria.waitForSwitch(
-                    startGrace: Self.playGateGrace(
-                        criteriaUnchanged: false,
-                        criteriaWrittenBeforeLoad: !loadedOptions.awaitsInboundCriteriaWrite,
-                        formatKnown: true,
-                        effectiveFormat: videoFormat,
-                        noWriterExpected: loadedOptions.sharedOutputRole == .secondary
-                    ),
-                    settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd,
-                    isCurrent: { self.loadGeneration == gen })
+                await awaitingDisplaySwitch(generation: gen) {
+                    await displayCriteria.waitForSwitch(
+                        startGrace: Self.playGateGrace(
+                            criteriaUnchanged: false,
+                            criteriaWrittenBeforeLoad: !loadedOptions.awaitsInboundCriteriaWrite,
+                            formatKnown: true,
+                            effectiveFormat: videoFormat,
+                            noWriterExpected: loadedOptions.sharedOutputRole == .secondary
+                        ),
+                        settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd,
+                        isCurrent: { self.loadGeneration == gen })
+                }
                 try checkLoadCurrent(gen)
                 if transportIntentUnderReconstruction ?? resumesPlaying { nativeHost?.play() }
                 else { nativeHost?.pause() }
