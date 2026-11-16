@@ -2281,7 +2281,7 @@ public final class Demuxer: @unchecked Sendable {
                 .replacingOccurrences(of: "\0", with: "")
         }
 
-        return TrackInfo(
+        var info = TrackInfo(
             id: index,
             name: name,
             codec: codecName,
@@ -2301,6 +2301,8 @@ public final class Demuxer: @unchecked Sendable {
             channelLayout: isAudio ? Self.channelLayoutDescription(&codecpar.pointee.ch_layout) : nil,
             profile: VideoStreamFormat.profileName(codecID: codecID, profile: codecpar.pointee.profile)
         )
+        if let title, !title.isEmpty { info.sourceTitle = title }
+        return info
     }
 
     static func sampleFormatName(_ raw: Int32) -> String? {
@@ -3043,6 +3045,24 @@ public final class Demuxer: @unchecked Sendable {
     /// #268: the source reader repositions itself on segmented sources whose natural axis is time.
     var timeSeekableReader: TimeSeekableIOReader? {
         (avioProvider as? CustomIOReaderBridge)?.timeSeekableReader
+    }
+
+    /// AE#1075: the open went through `openDASH`, so the container is the virtual fragmented MP4.
+    /// Read from the provider rather than the container name, which a plain MP4 shares.
+    var isDASHSource: Bool {
+        (avioProvider as? CustomIOReaderBridge)?.isDASHSource ?? false
+    }
+
+    /// AE#1075: a DASH source's declared video random-access points, seconds from the first. Empty for
+    /// every other source and for a DASH one whose sidx does not promise a SAP at every subsegment.
+    var dashRandomAccessStartsSeconds: [Double] {
+        (avioProvider as? CustomIOReaderBridge)?.dashRandomAccessStartsSeconds ?? []
+    }
+
+    /// AE#1075: how far audio can run ahead of video in a DASH source's read order, see
+    /// `DASHVirtualLayout.interleaveLeadSeconds`. 0 for every other source.
+    var dashInterleaveLeadSeconds: Double {
+        (avioProvider as? CustomIOReaderBridge)?.dashInterleaveLeadSeconds ?? 0
     }
 
     /// Every engine seek target is an ABSOLUTE source PTS, while a `TimeSeekableIOReader` addresses
