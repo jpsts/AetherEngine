@@ -117,6 +117,7 @@ These flags mean the same on every subcommand that takes them. The per-command t
 | `--no-dv` | `serve`, `validate`, `segverify` | Forces the SDR / HDR10 route, see [Dolby Vision routes](#dolby-vision-routes). | off |
 | `--force-dv` | `serve`, `validate`, `segverify` | `LoadOptions.forceDolbyVisionOnNonDVDisplay`: serves Profile 8.1 as Profile 5 (AE#455). Only with `--no-dv`. | off |
 | `--dv-base-layer` | `serve`, `validate`, `segverify`, `play` | `LoadOptions.dolbyVisionHandling = .baseLayerOnly`. | off |
+| `--untagged-color hdr10\|hlg` | `probe`, `serve` | `LoadOptions.untaggedVideoColor` (AE#1103): a 10-bit stream with no colour description is shown as HDR10 or HLG. A stream that declares anything keeps it. | off |
 | `--audio-index <n>` | `serve`, `customio` | Names the source audio stream at load. | engine choice |
 | `--standard-join` | `play`, `live` | `LoadOptions.liveJoinProfile = .standard`, see [Live join and cushion](#live-join-and-cushion). | `.fastZap` |
 | `--fast-zap` | `play`, `live` | Accepted and ignored, kept for older scripts. | |
@@ -176,7 +177,7 @@ The [Works on](#shared-flags) column lists where it is accepted.
 - A DTS-HD MA track whose frames do not decode as DTS:X logs `DTS-HD MA track is not DTS:X this engine renders (…); keeping the channel bridge` instead.
 - On `play` the 1 Hz line adds `obj=<active>/<declared> up=<overhead> bed=<layout>`, and `hch=<n>` for height channels.
 
-**Use a release build** (`swift build -c release`) for anything that plays the bed. A debug build renders it about five times slower than real time, so `play` waits on audio and ends in `VERDICT: clock did not advance` although nothing is wrong. aetherctl prints a note when a debug build gets `--atmos-bed`.
+On an M1 a debug build plays the bed in real time too. Before AE#1106 the regression ran at about a fifth of real time there, and `play` ended in `VERDICT: clock did not advance`. Judge CPU from a release build (`swift build -c release`), because in a debug build the rest of the pipeline still costs more. A debug build on an Apple TV has not been measured since the change.
 
 With `--bed-format lpcm` it sets `.lpcm(layout)` instead, which serves the bed as 24-bit PCM (`CODECS="…,ipcm"`, log `delivered as ipcm (lossless 24-bit PCM)`). With `--bed-format auto` it sets `.render(layout)`, the form a host should use: PCM, or APAC when the route plays over AirPlay.
 
@@ -199,7 +200,11 @@ On a 30 fps H.264 + AAC fixture the source's own alignment is +21.8 ms. `--audio
 
 **`--standard-join`** loads with `LoadOptions.liveJoinProfile = .standard`. Without it the load takes the engine default, `.fastZap`. `--fast-zap` is still accepted (and does nothing) so older scripts keep running. To judge a join, read the first-serve line (AE#374), not a first-frame stopwatch.
 
-The default `.fastZap` first serve prefers the full holdback (how far behind the live edge the first manifest waits to start). It does not wait forever: it is bounded after two finalized segments plus a 0.5 to 2.0 s observed-segment grace. That grace ends early once the source reads at 1x and the open segment cannot reach its next keyframe inside it (AE#936).
+The default `.fastZap` first serve goes out once the window holds the full holdback (how far behind the live edge the first manifest starts) or two finalized segments, whichever comes first.
+
+**`--startup-grace SECONDS`** sets `LoadOptions.liveStartupGraceSeconds`, an extra wait for a deeper first window. It ends early once the source reads at 1x and the open segment cannot reach its next keyframe inside it (AE#936). **`--single-segment-min SECONDS`** sets `LoadOptions.liveStartupSingleSegmentMinimumSeconds`.
+
+**Reading a start.** `live` prints every startup checkpoint and every `playbackPhase` change to the millisecond from load start (`STARTUP +0.193s routed`, `PHASE +0.221s playing`). The 1 Hz `JOIN` line is quantized to a second; use these to compare against a stopwatch.
 
 To try fastZap against an origin of your own (the shape a downstream player ships), put [`hlsfixture`](#hlsfixture) in front. The served `#EXT-X-TARGETDURATION` is then floored by the upstream's observed arrival cadence (`LiveCadencePolicy`). `live`'s raw-TS fixture has no playlist, so it cannot show this. The numbers are in [Measurements › fastZap against an own origin](measurements.md#play-fastzap-against-an-own-origin-ae374).
 
@@ -243,13 +248,14 @@ Opens the demuxer, prints what it finds, then exits. No HLS server is started. I
 - the subtitle track list with language, `(default)` and title,
 - the parsed container metadata (`MediaMetadata`): title, artist, album, and the size of embedded cover art (`artwork: N bytes`).
 
-**Usage:** `aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>`
+**Usage:** `aetherctl probe [--untagged-color hdr10|hlg] [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>`
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--detect-hdr10plus` | Adds the HDR10+ detail pass of `AetherEngine.probe(url:detecting:)`. | off |
 | `--detect-atmos` | Adds the Atmos detail pass: E-AC-3 JOC, and for TrueHD the major sync, printed as `truehd-atmos=atmos|noAtmos|unsettled` (#1035). | off |
 | `--detect-hdr-vivid` | Adds the HDR Vivid (CUVA) check to the same packet pass. Prints `HDR Vivid: CUVA metadata seen`. | off |
+| `--untagged-color hdr10\|hlg` | Probes with `LoadOptions.untaggedVideoColor` (AE#1103). The `colour:` line and `format:` then read what the session would play, and a `[Demuxer] AE#1103` line says whether it applied and why not. | off |
 | `--detect-dv-el` | Adds the Dolby Vision enhancement-layer check to the same packet pass (#1030). Prints `DV EL: FEL` or `DV EL: MEL`; `not Profile 7` when the container declares no Profile 7, `no RPU seen` when none turned up in the budget. | off |
 
 ```bash
@@ -584,6 +590,7 @@ Other lines `play` prints:
 | `--native-hls` | `LoadOptions.nativeRemoteHLS`. | off |
 | `--standard-join`, `--fast-zap`, `--live-cushion SECONDS` | Live join profile and cushion. See [Shared flags](#shared-flags). | `.fastZap`, engine default |
 | `--live-start-immediately` / `--no-live-start-immediately` | `LoadOptions.liveJoinStartsImmediately` (AE#440). | on |
+| `--live-join-at-start` | `LoadOptions.liveJoinsAtPlaylistStart` (AE#1090): joins at the oldest listed segment. Pair with [`hlsfixture --recording-backlog`](#a-recording-in-progress---recording-backlog). | off |
 | `--header "Name: Value"` | `LoadOptions.httpHeaders`, repeatable. | none |
 | `--trust-any-certificate` | Answers `EngineTLS.serverTrustEvaluator` for every origin (AE#495). | off |
 | `--record <path>` | Records the live source to a file (AE#560). | off |
@@ -607,6 +614,7 @@ Other lines `play` prints:
 | Flag | Meaning | Default |
 |---|---|---|
 | `--switch-audio <index>[@ms]` | Switches the audio stream just after playback starts (#337). | +20 ms |
+| `--live-reopen-param NAME` | Answers `liveReopenURL` by giving the query parameter `NAME` a new value on every reopen, the way a host mints a fresh HDHomeRun `SessionID` (AE#1100). Each answer prints a `LIVEREOPEN` line. | off |
 | `--audio-delay <ms>` | `LoadOptions.audioDelaySeconds` at load. See [Shared flags](#shared-flags). | 0 |
 | `--switch-audio-delay <ms>[@ms]` | Calls `setAudioDelay(_:)` mid-session. Repeatable. | +20 s |
 | `--audio-shaping <spec>` | `LoadOptions.audioShaping` at load. | off |
@@ -632,6 +640,7 @@ Other lines `play` prints:
 | `--line-art` | `LoadOptions.upscaleScaler = .lineArt` (AE#1039); implies `--upscale`. | off |
 | `--tone-map <nits>` | `LoadOptions.videoProcessing` with this `targetPeakNits` (#957). | off |
 | `--deinterlace-field-rate field\|frame` | `LoadOptions.deinterlaceFieldRate` (AE#492). | `field` |
+| `--inverse-telecine auto\|off\|force` | `LoadOptions.inverseTelecine` (#853). | `auto` |
 | `--native-video-frame-diagnostics` | `LoadOptions.nativeVideoFrameDiagnostics`. | off |
 | `--native-video-frame-recovery` | Bounded SDR native decoded-output repair. | off |
 
@@ -693,8 +702,18 @@ A misspelt call is not an error: it prints `HOSTCALL unknown '<call>'` and the r
 | `subsoff@N`, `subson@N` | The viewer turning subtitles off and back on while the picture is away. Defaults t=12 and t=18. `subson` re-picks the `--subs` track; `subson@N:<lang>` picks a different one (the track-switch case). |
 | `subsatload` | Picks the `--subs` track the moment `load` returns, before the first frame, like a host restoring a remembered track. The default pick at t=5 is a mid-session start, which the prefetch and the drain handle differently (#1021). `CUE` lines end in `at=<clock>`, so the lead a cue arrived with is readable. |
 | `lanreload@N` | Fires `reloadAtCurrentPosition()` (AE#955). Default t=10. |
+| `stopreopen@N`, `stopreopen@N:off` | Stop at t=N (default 20), then load the same URL at the stopped position, with `retainsSessionCacheAfterStop` on, or off for the control arm (AE#1095). See below. |
 
 **`pausestart`.** This is the shape of a host that holds a fresh load paused. On a software session the healthy reading is: the `[SWHost] #104` lines show the first frame presented at a stopped clock, and `startup 8/8 presenting` arrives while paused. The defect reading is eight ticks of `enq=+0 status=unknown r4d=n`: a black picture under a paused clock.
+
+**`stopreopen`.** The viewer who leaves to the detail page and presses Resume. The first session plays N seconds without telemetry, then `stop()`, two seconds of nothing, and a `load()` of the same URL at the stopped position. The telemetry after that describes the reopened session. Three lines carry the result: `stopped at <s>, retained <n> MiB`, `load returned after <ms>` and `clock moving after <ms>`, the last one being the wait a viewer feels. Run both arms against an origin with a delay and a rate limit, or loopback hides the difference:
+
+```bash
+aetherctl play --seconds 20 --host-calls stopreopen@25     http://127.0.0.1:8871/movie.mkv
+aetherctl play --seconds 20 --host-calls stopreopen@25:off http://127.0.0.1:8871/movie.mkv
+```
+
+Also run it on a source whose timestamps do not start at zero (`-output_ts_offset 600`): `cur=` has to continue from the stopped position there, not jump by the offset.
 
 **`reloadnext`.** The same URL is loaded again at t=4 on the still-playing engine, with no `stop()` in between, so the native host is reused. Every published `state` prints as `STATE <state> t=<s>`. The second load must go `loading`, `playing` with no `paused` between them. The defect behind this drill: the reused host still carried the outgoing item's `.playing` status, and every host raised its transport over the next episode.
 
@@ -743,7 +762,12 @@ aetherctl play --subs eng --seconds 30 \
   --host-calls nativesubs,lanreload@8,nativerender@14,subson@15 file://$PWD/pgs.mkv
 ```
 
-A healthy run arms `[SubtitleOCR] worker armed` once, logs `OCR pre-fill done ... exit=covered`, and reads `selected=English engineActive=4` after the on. The first Vision call in a process can take about a minute while the system compiles its model, so judge a slow pre-fill from a second run. The `VTT` readout fetches the first rendition when none is selected, so its empty segments before the select are the harness asking, not a receiver.
+A healthy run arms `[SubtitleOCR] worker armed` once, logs `OCR pre-fill done ... exit=covered`, and reads `selected=English engineActive=4` after the on. A `pre-fill done ... exit=superseded` right before it is expected: `subson` re-picks the track a tick after `nativerender` and replaces that select.
+
+Two things make this drill read empty without any engine defect:
+
+- **The PGS pictures need readable text.** A fixture with stripes or blank boxes gives OCR nothing, so the rendition stays empty and the engine correctly refuses to select it (`native subtitle select refused: rendition ordinal=0 is empty at the playhead`).
+- **Vision has to compile its model first.** The first text recognition after a fresh `aetherctl` build, or after macOS dropped the cached model, takes about a minute on a Mac (53 s measured, 0.05 s after). Every drill with `nativerender` therefore runs one recognition before the load and prints `OCR warm-up: Vision text recognition ready after N s`. Without it, the readouts at +2 and +4 ticks came long before the pre-fill could finish (AE#1052). The `VTT` readout fetches the first rendition when none is selected, so its empty segments before the select are the harness asking, not a receiver.
 
 ### Sidecar subtitles (`--sidecar`)
 
@@ -818,6 +842,17 @@ Serve an HLS master over https with a self-signed certificate, and the two arms 
 
 - Pick a stream whose first packet sits late in the mux. The defect reading (before the fix) is `state=playing cur=0.00` for the whole run with a first frame on screen. The end-of-run verdict names it.
 - `--audio-stats` with it re-installs the tap after the switch. The tap is bound to the software host the switch replaces, and would otherwise report silence for a session that is playing fine.
+- On a software live session with a ring the switch happens in place (AE#1100): no rebuild, and the log shows `AE#1100 live audio switched in place`. The tap re-install is then harmless.
+
+**A replaying live origin (AE#1100).** To see whether a live session opens its source twice, put an origin in front that behaves like an HDHomeRun tuner: a `SessionID` opened again replays from where that session began. Then read the origin's request log. Measured on a 720p MPEG-2 fixture with two AC-3 tracks (`-ac:a:0 2 -ac:a:1 6`):
+
+```bash
+aetherctl play --live --dvr-window 600 --switch-audio 2@25000 --seconds 45 "http://127.0.0.1:8912/auto/v4.1?ClientID=1&SessionID=101"
+aetherctl play --live --live-reopen-param SessionID --switch-audio 2@15000 --seconds 30 "<same URL>"
+```
+
+- With the ring, the switch opens nothing: one request in the origin log, `cur` runs on (23.42 to 24.36 s) and `range=` keeps its start.
+- Without a ring the switch reloads. Without the flag the reload replayed the session (the source PTS fell from 31.05 to 18.04 s); with `--live-reopen-param SessionID` it opened `SessionID=9r1` at live (31.29 to 32.96 s).
 
 Build a fixture with a late track by offsetting one input:
 
@@ -906,6 +941,7 @@ The mid-session switch is the harder case. At load the offset is just a number h
 | `preferred-audio` | comma list of languages | preferred audio languages |
 | `decode-path` | a `DecodePath` raw value, for example `software` | `preferredDecodePath` |
 | `dolby-vision` | a `DolbyVisionHandling` raw value, for example `baseLayerOnly` | `dolbyVisionHandling` |
+| `untagged-color` | `standard\|hdr10\|hlg` | `untaggedVideoColor` (AE#1103), the per-title "Force HDR" switch a host offers |
 | `prefer-dual-layer-dv` (alias `fel-mode`) | `true\|false` | `LoadOptions.preferDualLayerDolbyVision`, so a running session can move on or off the Profile 7 FEL route |
 | `is-live` | `true\|false` | Drives the refusal: a field that names the session must be observably refused, not observably ignored. |
 | `autoplay` | `true\|false` | Drives the third answer: a field the session owns, neither refused nor applied. |
@@ -986,6 +1022,20 @@ Measured on a 480i fixture through the hardware chain, four runs per arm: 59.9 f
 
 Nothing binds a render surface in a CLI run, so the absolute drop level belongs to the harness. Only the ratio between arms is a measurement.
 
+### Inverse telecine (#853)
+
+`--inverse-telecine auto|off|force` sets `LoadOptions.inverseTelecine`. On a hard-telecined NTSC MPEG-2 source the load logs its decision before the `[AetherEngine] load` line, and that line's `rate=` is the rate asked of the display:
+
+```
+[Deinterlace] inverse telecine on: film, progressive 100% of 60 decided frames, cadence 100%, 61 frames in 155 ms, 155 ms with the rewind (#853)
+[AetherEngine] load url=... rate=23.976
+[Deinterlace] engaged [hardware]: 720x480 pixFmt=0 (format=nv12,hwupload,fieldmatch_videotoolbox=order=auto:combmatch=full,decimate_videotoolbox,bwdif_videotoolbox=mode=send_frame:parity=auto:deint=interlaced) outTB=1001/48000 built in 5.8ms
+```
+
+That is the GPU cadence (#1108). When it cannot run (see [formats › Inverse telecine](formats.md#inverse-telecine)), `fieldmatch` and `decimate` sit before `format=nv12,hwupload` on the CPU instead, and a build failure logs a line saying so.
+
+With `--frame-times` the output reads `ft=24` a second and the `[SWDiag]` lines `dpts=41.7/41.7`; the deinterlacer alone reads `ft=60` at field rate. The sample's cost to the first frame over a throttled origin is in [measurements › Inverse telecine](measurements.md#inverse-telecine-853).
+
 ### Frame times (`--frame-times`, `--present-times`)
 
 **`--frame-times`** installs the #311 software frame-time observer BEFORE `load()` (the documented usage: the engine re-arms each new host with it) and reads `softwarePresentationTimebase`. Each tick appends:
@@ -1015,7 +1065,7 @@ Nothing binds a render surface in a CLI run, so the absolute drop level belongs 
 - A seek lands only inside the resident span that reaches the producer's frontier; every other target is rejected (AE#958).
 - On VOD it needs `--declared-duration S`, which fills `LoadOptions.declaredDurationSeconds`. The duration estimate normally comes from the tail read, which this shape skips.
 
-**`--iframes`** sets `LoadOptions.serveIFramePlaylist` (AE#682). `serve --iframes` only lists the rendition; `play` also runs the 1 Hz still ladder that reads into it. The log says `[StillLadder] reading through the I-frame rendition`. To see the effect, add `--served-url`, wait about 45 s, and `curl` `iframe<N>.mp4` next to the printed URL: an index near the playhead is answered from the cache in about a millisecond, one far from it pays the read (and for HDR the tone map).
+**`--iframes`** sets `LoadOptions.serveIFramePlaylist` (AE#682). `serve --iframes` only lists the rendition; `play` also runs the 1 Hz still ladder that reads into it. The log says `[StillLadder] reading through the I-frame rendition`. To see the effect, add `--served-url`, wait about 25 s, and `curl` `iframe<N>.mp4` next to the printed URL. An index near the playhead is answered from the cache in about a millisecond, one far from it pays the read (and for HDR the tone map). The window reads back to back once the ladder starts at 15 s, so 30 segments either way take a few seconds, not two minutes.
 
 **`--skip-attachments`** sets `LoadOptions.skipsContainerAttachments` (AE#956). A Matroska source then opens without reading its attached files (the fonts of its ASS subtitles). The observable is the open itself. Against a throttled origin and an MKV that carries fonts, the time to the first `[AetherEngine]` load line drops by the fonts' transfer time, and the `[AVIOReader]` byte counts drop by their size.
 
@@ -1249,7 +1299,7 @@ Tests scrub previews. By default it covers Dolby Vision Profile 5 / 10.0 sources
 
 The default mode needs a build WITHOUT the `DolbyVisionStillReshaping` trait. With the trait such a source serves reshaped stills instead of drawing in a view, so the default mode fails with exit 1; use `--stills` there.
 
-**Usage:** `aetherctl scrubpreview [--warm S] [--at s1,s2,...] [--keep DIR] [--throttle-kbps N] [--stills [--max-concurrent-requests N] [--forward-buffer-segments N]] <url>`
+**Usage:** `aetherctl scrubpreview [--warm S] [--at s1,s2,...] [--keep DIR] [--throttle-kbps N] [--stills [--max-concurrent-requests N] [--forward-buffer-segments N] [--inverse-telecine auto|off|force]] <url>`
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -1260,6 +1310,7 @@ The default mode needs a build WITHOUT the `DolbyVisionStillReshaping` trait. Wi
 | `--stills` | Asks `scrubPreviewFrame` instead, for any source. | off |
 | `--max-concurrent-requests N` | Only with `--stills`. See [Shared flags](#shared-flags). | engine default |
 | `--forward-buffer-segments N` | Passes through to `LoadOptions`. Only with `--stills`. | engine default |
+| `--inverse-telecine auto\|off\|force` | `LoadOptions.inverseTelecine` for the playing session, only with `--stills`. The stills themselves always come off the plain deinterlacer (#853). | `auto` |
 
 **Default mode.** Loads the source on the native path, plays it for `--warm` seconds, then asks `showScrubPreview(atSeconds:in:)` for each position. For each it prints whether a picture came, how long it took, the span it stands for, and whether the position was resident.
 
@@ -1771,6 +1822,7 @@ It prints the entry URL: `/media.m3u8`, `/master.m3u8` with `--master`, or `/ent
 | `--redirect-host H` | Host name for the redirect target. | `localhost` |
 | `--redirect-port N` | Port for the redirect target. | the fixture's bound port |
 | `--media-origin H:P` | Master's variants point at a second origin absolutely. | off |
+| `--recording-backlog N` | A recording in progress: the playlist lists every segment from 0 and grows, N segments deep at start. `--window` is ignored. See [below](#a-recording-in-progress---recording-backlog). | off |
 
 **Exit codes**
 
@@ -1789,6 +1841,18 @@ ffmpeg -i in.ts -c copy -f hls -hls_time 4 -hls_flags independent_segments -hls_
 Byte slicing is not keyframe-aligned, so segments start mid-GOP and the decoder logs parameter-set errors on the rerouted ingest. That is fine for routing and plumbing questions ("did it route"), but useless for "did it play": the run rebuffers forever because nothing decodes. Use the directory whenever the question is playthrough.
 
 **`--codecs` / `--resolution`.** Without them AVFoundation reports no `videoAttributes` for the variants. Everything that reads master evidence (the #168 watchdog, the #293 probe gate) then sees a master advertising no video at all, and the fixture quietly stops carrying the case under test.
+
+### A recording in progress (`--recording-backlog`)
+
+`--recording-backlog N` serves the shape a DVR gives for a recording that is still running: `#EXT-X-MEDIA-SEQUENCE:0`, every segment since the start, no `#EXT-X-ENDLIST`, and one more segment per `--segment-seconds`. It is the origin for `play --live-join-at-start` (AE#1090):
+
+```bash
+aetherctl hlsfixture --segments-dir ./segs --segment-seconds 2 --recording-backlog 150 --port 8091
+aetherctl play --live --live-ingest --live-join-at-start --dvr-window 3600 --seconds 50 \
+  --seek-every 30 --seek-count 1 --seek-pattern 1 http://127.0.0.1:8091/media.m3u8
+```
+
+What to read off the run: the `[HLSIngest] AE#1090: joined at the playlist start` line says how much was delivered at once, the fixture's `REQ /segN.ts` lines start at `seg0` and then come one per segment duration, and `src=` starts near 0. Measured on 2 s H.264 and MPEG-2 segments with a 5 minute backlog: first picture within a second on both routes, 27 segments fetched in 46 s, and a seek back to 1 s landing in 105 ms with the edge still moving at 1x.
 
 ### TARGETDURATION and window depth (`--target-duration`, `--window`)
 

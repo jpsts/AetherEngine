@@ -52,7 +52,7 @@ final class NativeAVPlayerHost {
     var iFramePlaylistWithheld: (@Sendable () -> Bool)?
     /// AE#561: what the session can still offer when AVPlayer refuses the media, answered by the
     /// engine because the host owns none of it. Set at mount, read only while classifying a failure.
-    var softwarePathAvailability: (@Sendable () -> SoftwarePathEscalation.Availability?)?
+    var softwarePathAvailability: (@MainActor () -> SoftwarePathEscalation.Availability?)?
     /// #50: latched on first .playing; discriminates startup failures (never played) from mid-playback transients. .failed and timeControlStatus KVOs are unsynchronized, so instantaneous status is unreliable. Reset with the item on a reused host.
     private var hasEverPlayed = false
     @Published private(set) var didReachEnd: Bool = false
@@ -346,6 +346,25 @@ final class NativeAVPlayerHost {
             }
         }
     }
+    /// AE#1080: whether the host app wants this player's audio to outlive a trip to the background.
+    /// Under the default `.automatic` policy iOS pauses any item that carries video once the app
+    /// leaves the foreground, PiP aside, so the engine's keepalive kept a session nobody could hear.
+    /// The policy grants no background time by itself: the app still needs the `audio` background
+    /// mode and a playback audio session.
+    var backgroundAudioAllowed = false {
+        didSet {
+            #if os(iOS)
+            avPlayer.audiovisualBackgroundPlaybackPolicy = Self.backgroundPlaybackPolicy(
+                allowed: backgroundAudioAllowed)
+            #endif
+        }
+    }
+
+    nonisolated static func backgroundPlaybackPolicy(allowed: Bool)
+        -> AVPlayerAudiovisualBackgroundPlaybackPolicy {
+        allowed ? .continuesIfPossible : .automatic
+    }
+
     private var statusObservation: NSKeyValueObservation?
     /// One-shot guard; route capability check runs after first .playing, not readyToPlay -- early sampling false-positived the downmix warning on stereo-idle sinks (issue #24).
     private var didSampleSettledRoute = false
@@ -2049,7 +2068,9 @@ final class NativeAVPlayerHost {
     /// swap opens: `replaceCurrentItem` blanks this layer until the next item's first frame, however
     /// long the old item was kept. An output belongs to one item and is only attached for the read.
     /// nil when no frame arrives inside `timeout`, which the caller treats as "nothing to hold".
-    func captureDisplayedFrame(timeout: Duration = .milliseconds(500)) async -> CVPixelBuffer? {
+    func captureDisplayedFrame(
+        timeout: Duration = AetherEngine.heldPictureFrameWait(seconds: AetherEngine.defaultHeldPictureFrameWaitSeconds)
+    ) async -> CVPixelBuffer? {
         guard let item = playerItem else { return nil }
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
@@ -2813,7 +2834,7 @@ final class NativeAVPlayerHost {
             switch evidence {
             case .settled(let verdict):
                 self.publishCarriageProbeVerdict(verdict, sid: sid, from: "playlist")
-            case .needsSegmentHead(let segmentURL):
+            case .needsSegmentHead(let segmentURL, let segmentKey):
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sid) carriage probe: the playlists cannot settle this one, "
                     + "so the segment head waits for readyToPlay rather than compete with the mount (#296)",
@@ -2836,10 +2857,11 @@ final class NativeAVPlayerHost {
                 }
                 let verdict = await SourceNetworkDiagnostics.$context.withValue(diagnosticContext) {
                     await HLSCarriageProbe.classifyDeferredSegmentHead(
-                        url: segmentURL, httpHeaders: httpHeaders, credentialOrigin: url)
+                        url: segmentURL, key: segmentKey, httpHeaders: httpHeaders, credentialOrigin: url)
                 }
                 guard !Task.isCancelled, self.sessionID == sid else { return }
-                self.publishCarriageProbeVerdict(verdict, sid: sid, from: "segment PMT")
+                self.publishCarriageProbeVerdict(
+                    verdict, sid: sid, from: segmentKey == nil ? "segment PMT" : "decrypted segment PMT (#1089)")
             }
         }
     }

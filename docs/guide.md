@@ -139,6 +139,8 @@ Use `seekEvents` (`AnyPublisher<SeekEvent, Never>`) wherever the end of a seek m
 
 `$isSeeking` alone cannot tell you whether a seek landed, gave up or was replaced. And on a stalled source, a seek that gave up can still land minutes later.
 
+Each event also says who asked (`origin`) and where the playhead stood when it was asked (`departure`). A skip from Control Center or the iPhone Remote that the engine handled has origin `.remoteCommand`, so you can react to every skip back without intercepting commands. See [Seek events](api.md#seek-events).
+
 ### videoRoute
 
 `videoRoute` says which pipeline plays the session:
@@ -395,6 +397,7 @@ An assertion only ever adds a capability, so neither flag can hide one the syste
 - What it does: it serves a Profile 8.1 (or converted Profile 7) source as Profile 5. AVPlayer then composes the Dolby Vision picture itself, instead of handing the TV only the HDR10 base layer ([#455](https://github.com/superuser404notfound/AetherEngine/issues/455)).
 - The risk: a tvOS build that reads the base layer's colours from the profile field would show a green / violet cast.
 - Asserting `panelPresentsDolbyVision` turns it off.
+- A file that also carries HDR10+ loses that HDR10+ on this route. On an HDR10+ TV, also set `preferHDR10PlusOverForcedDolbyVision`, and such a file keeps its HDR10+ (Sodalite#245).
 
 Details in [api.md › forceDolbyVisionOnNonDVDisplay](api.md#forcedolbyvisiononnondvdisplay).
 
@@ -495,7 +498,7 @@ What `.fastZap` changes:
 
 - **Shorter segments.** Live segments are cut at every keyframe after 0.5 s instead of the standard ~4 s. The served `TARGETDURATION` drops to 1.5 x the source GOP length: 1 s GOPs serve 2, and so do segments up to 1.666 s. The headroom covers a broadcast's irregular GOPs (#670).
 - **Smaller holdback.** The live-edge holdback (`HOLD-BACK` = 3 x `TARGETDURATION`, the RFC 8216bis minimum, #189) shrinks with it.
-- **A bounded start.** The first manifest still prefers the full holdback. After two finished segments, a source that delivers strictly in real time gets one grace period of one observed segment, clamped to 0.5...2.0 s. After that, a shallow first window may be served so startup stays bounded. This can cause one early `-16832` error or a short rebuffer.
+- **A bounded start.** The first manifest goes out once the window holds the full holdback or two finished segments, whichever comes first. A shallow first window is normal, and on a source that delivers strictly in real time it can cause one early `-16832` warning or a short rebuffer. `liveStartupGraceSeconds` adds a wait for a deeper window if a host prefers that.
 - **Less patience.** A smaller `TARGETDURATION` also makes AVPlayer less patient with an unchanged playlist, and keeps a smaller buffer at the live edge. Origins that stall or deliver in bursts mid-stream rebuffer more easily.
 
 ### The retune request: `liveSourceReset`
