@@ -1058,8 +1058,21 @@ public final class AetherEngine: ObservableObject {
     /// Whether renderer paths activate the shared audio session during load and interruption recovery.
     /// Disable before loading when the host owns activation across several inline players.
     /// The category is still declared once per process; pair with `deactivatesAudioSessionOnStop = false`
-    /// when the host also owns final deactivation. Native AVKit activation is unaffected.
+    /// when the host also owns final deactivation. The native path has its own switch,
+    /// `nativeAudioSessionActivationEnabled`.
     public var rendererAudioSessionActivationEnabled = true
+
+    /// AE#1110: activate the shared audio session on the native path too, after the play gate and right
+    /// before the first `play()` or the paused mount. Default `false`.
+    ///
+    /// Turn it on when the host mounts the bare `AVPlayerLayer` (`AetherPlayerSurface`, `nativePlayerLayer`)
+    /// instead of an `AVPlayerViewController`. AVKit's view activates per playback; without it the host had
+    /// to activate on its own, and it has no moment after the display mode switch but before `play()`. The
+    /// engine then activates at the same point the software path does (AE#1099), so the HDMI audio link is
+    /// negotiated with the panel already in its new mode. Only `setActive(true)`: the channel count stays
+    /// AVPlayer's to negotiate. The remote HLS bypass has no play gate and activates right before `play()`;
+    /// the end of an audio interruption and a remote Play reactivate too.
+    public var nativeAudioSessionActivationEnabled = false
 
     /// Keep a paused video session through background suspension instead of releasing its pipeline.
     /// Off by default: the system may invalidate decoders while suspended, requiring a reload.
@@ -1289,6 +1302,7 @@ public final class AetherEngine: ObservableObject {
             #if os(macOS)
             updatePictureInPictureAspect()
             #endif
+            if oldValue != softwareDisplaySize { refreshFillTransform() }
         }
     }
     #if os(macOS)
@@ -1657,7 +1671,9 @@ public final class AetherEngine: ObservableObject {
 
     /// Decoded cues for the active subtitle source (sidecar or embedded side-demuxer). When
     /// `LoadOptions.prepareNativeSubtitles` is set, cues also flow into NativeSubtitleCueStore for mov_text injection (#55).
-    @Published public internal(set) var subtitleCues: [SubtitleCue] = []
+    @Published public internal(set) var subtitleCues: [SubtitleCue] = [] {
+        didSet { scheduleBitmapTextRecognition() }   // AE#1114
+    }
     /// #100: per-channel holdback for PGS cues arriving behind the playhead (catch-up bursts after
     /// side-reader starvation). Reset wherever the cue arrays reset (track switch, seek re-anchor,
     /// clear, load/stop) so a hold can never leak across subtitle sessions.
@@ -1691,6 +1707,8 @@ public final class AetherEngine: ObservableObject {
     /// AE#1099: runs where a renderer path asks for its audio session, on every platform, so the order
     /// against the software host build and the play gate is observable without a session.
     var rendererAudioActivationForTesting: (@MainActor () -> Void)?
+    /// AE#1110: the same for the native path's activation after its play gate.
+    var nativeAudioActivationForTesting: (@MainActor () -> Void)?
     /// AE#628: lets a test drive the drain tick with a real decoder but no playback session.
     var subtitleDrainDecoderFactoryForTesting: ((Int32) -> EmbeddedSubtitleDecoder?)?
     #endif
@@ -1756,6 +1774,17 @@ public final class AetherEngine: ObservableObject {
     /// monotonic for the engine's lifetime is collision-proof and needs no coordination with the many
     /// array-clear sites.
     var nextRetainedSubtitleCueID: Int = 0
+    /// AE#1114: the loop reading bitmap cue text for the overlay, nil while idle. The generation
+    /// moves on load and stop, so a loop or a reading from the previous session writes nothing.
+    var bitmapTextRecognitionTask: Task<Void, Never>?
+    var bitmapTextRecognitionGeneration: UInt64 = 0
+    var bitmapTextFirstReadLogged = false
+    /// Counts sidecar installs per channel, so a pending reading can tell its sidecar from a later one.
+    var sidecarBitmapSourceEpochs: [SubtitleChannel: UInt64] = [:]
+    #if DEBUG
+    /// Stands in for Vision in tests, so they drive the plumbing and not the OS's model cache.
+    var bitmapTextRecognizerForTesting: (@Sendable (CGImage, String?) -> SubtitleRecognizedText)?
+    #endif
     nonisolated static let subtitleDrainLeadSeconds: Double = 60
     /// #362: how far the forward prefetch (#151) parks BEYOND the drain window's forward edge.
     ///
@@ -1835,7 +1864,9 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var secondarySidecarASSHeader: String? = nil
 
     /// Cues for the secondary subtitle track (#47). Text and supported bitmap codecs; independent of primary.
-    @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = []
+    @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = [] {
+        didSet { scheduleBitmapTextRecognition() }   // AE#1114
+    }
     @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
     @Published public internal(set) var isSecondarySubtitleActive: Bool = false
 
@@ -2015,18 +2046,44 @@ public final class AetherEngine: ObservableObject {
         get { _videoGravity }
         set {
             _videoGravity = newValue
-            // Most tvOS hosts use AVPlayerViewController, which mounts its own AVPlayerLayer.
-            // Still correct for hosts that use the engine's layer directly and for the SW displayLayer.
-            nativeHost?.playerLayer.videoGravity = newValue
-            softwareHost?.displayLayer.videoGravity = newValue
-            #if DualLayerDolbyVision
-            dualLayerOutputRoute?.setVideoGravity(newValue)
-            #endif
-            // The PiP fit depends on the gravity and no layout pass follows a change.
-            if softwareHost != nil { boundView?.refreshHostedLayerFrame() }
+            applyEffectiveVideoGravity()
         }
     }
     var _videoGravity: AVLayerVideoGravity = .resizeAspect
+
+    /// The part of the picture that should cover the bound view, normalized to the frame (a
+    /// `PictureArea.rect`), or nil for plain `videoGravity` behaviour (Sodalite#118). While set, the
+    /// engine's own layers lay out `.resizeAspect` and the bound `AetherPlayerView` zooms them with
+    /// `PictureFillGeometry`, so a 2.39 film painted into a 16:9 raster fills a 16:9 screen. A host
+    /// that renders through AVKit applies the same geometry to AVKit's layer itself.
+    public private(set) var fillPictureArea: CGRect?
+
+    public func setFillPictureArea(_ area: CGRect?, animated: Bool = false) {
+        guard area != fillPictureArea else { return }
+        fillPictureArea = area
+        applyEffectiveVideoGravity()
+        refreshFillTransform(animated: animated)
+    }
+
+    /// `.resizeAspect` while a fill area zooms the picture, the host's gravity otherwise.
+    var effectiveVideoGravity: AVLayerVideoGravity { fillPictureArea == nil ? _videoGravity : .resizeAspect }
+
+    private func applyEffectiveVideoGravity() {
+        let gravity = effectiveVideoGravity
+        // Most tvOS hosts use AVPlayerViewController, which mounts its own AVPlayerLayer.
+        // Still correct for hosts that use the engine's layer directly and for the SW displayLayer.
+        nativeHost?.playerLayer.videoGravity = gravity
+        softwareHost?.displayLayer.videoGravity = gravity
+        #if DualLayerDolbyVision
+        dualLayerOutputRoute?.setVideoGravity(gravity)
+        #endif
+        // The PiP fit depends on the gravity and no layout pass follows a change.
+        if softwareHost != nil { boundView?.refreshHostedLayerFrame() }
+    }
+
+    func refreshFillTransform(animated: Bool = false) {
+        boundView?.setFill(area: fillPictureArea, softwarePresentationSize: softwareDisplaySize, animated: animated)
+    }
 
     // MARK: - Capabilities
 
@@ -2327,7 +2384,9 @@ public final class AetherEngine: ObservableObject {
     /// Attaches nativeHost.playerLayer or softwareHost.displayLayer to the bound view. No-op when no host.
     func presentCurrentLayer() {
         guard let view = boundView else { return }
-        defer { updatePictureFit() }
+        // The fill travels with the layer: a surface it falls back to after an unbind or a takeover
+        // was detached once and lost it.
+        defer { updatePictureFit(); refreshFillTransform() }
         if let host = nativeHost {
             view.attach(host.playerLayer)
             view.attachOverlay(dualLayerOutputLayer)
@@ -2932,9 +2991,38 @@ public final class AetherEngine: ObservableObject {
     /// attach and the `pasp` the loopback fMP4 carries.
     public private(set) var sourceVideoPixelAspectRatio: Double = 1
 
-    /// MKV font attachments from the probe. Hosts write these to disk for ASS renderer font config (AetherEngine#30).
-    /// Not @Published and not in SourceProbe: payloads are 10-30 MB and only playback hosts need them.
-    public private(set) var fontAttachments: [FontAttachment] = []
+    /// MKV font attachments. Hosts write these to disk for ASS renderer font config (AetherEngine#30).
+    /// Not in SourceProbe: payloads are 10-30 MB and only playback hosts need them.
+    ///
+    /// AE#1129: by default they arrive after the first frame, read by a second reader, so a host
+    /// observes `$fontAttachments` rather than reading it once at load. Empty until then, and for good
+    /// under `LoadOptions.skipsContainerAttachments`. `readsContainerAttachmentsAtOpen` restores the
+    /// read at open, where the list is complete when `load()` returns.
+    @Published public private(set) var fontAttachments: [FontAttachment] = []
+
+    /// Where this load reads its Matroska attachments (AE#1129), resolved once per load before the first
+    /// open. `playbackOpenProfile(options:)` reads it, so every open of the session agrees.
+    var attachmentReadPlan: AttachmentReadPlan = .skip
+    var deferredAttachmentTask: Task<Void, Never>?
+    var deferredAttachmentDemuxer: Demuxer?
+    /// Identifies the side read that may still publish; replaced by every start and cleared with the item.
+    var deferredAttachmentToken: UUID?
+    /// Test seam: holds the side read between registering its demuxer and opening it, so a test can
+    /// stop the session in that window. Zero in production.
+    var deferredAttachmentReadDelayNanosForTesting: UInt64 = 0
+    /// How long the side read waits after the first frame for playback to build its cushion
+    /// (`AetherEngine.deferredAttachmentBufferSeconds`). 10 s; tests set 0.
+    var deferredAttachmentCushionWaitNanos: UInt64 = 10_000_000_000
+
+    /// AE#1129: the side read's results land here, on the session that started it. A cover only fills a
+    /// `metadata` that has none, so a container tag is never replaced.
+    func publishDeferredAttachments(fonts: [FontAttachment], artwork: Data?) {
+        if !fonts.isEmpty { fontAttachments = fonts }
+        if let artwork, let current = metadata, current.artworkData == nil {
+            metadata = MediaMetadata(title: current.title, artist: current.artist, album: current.album,
+                                     artworkData: artwork)
+        }
+    }
 
     /// Latched at load; reused by audio-track-switch reload to re-derive activeVideoDecoder without re-probing.
     /// Reset to AV_CODEC_ID_NONE in stopInternal.
@@ -3018,8 +3106,9 @@ public final class AetherEngine: ObservableObject {
     /// AE#1052: bumped by every native selection, so a pre-fill that outlived its request stops.
     var nativeSubtitleSelectGeneration: UInt64 = 0
 
-    /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
-    var externalNativeStoreFillTask: Task<Void, Never>? = nil
+    /// Whole-file decodes filling native stores for load-declared external tracks (#88), one at a
+    /// time, the picked track first (AE#984).
+    let externalNativeStoreFillQueue = ExternalSubtitleFillQueue()
 
     /// Phase D: OCR worker state. Armed while the active subtitle is a needsOCR table entry;
     /// cursors/pending persist across deselect/reselect (no re-recognition of covered regions)
@@ -3075,6 +3164,10 @@ public final class AetherEngine: ObservableObject {
     /// sidecars as legible renditions. Nil whenever the bypass plays the origin URL directly, which is
     /// every live source, every source without declared sidecars, and every refused rewrite.
     var remoteHLSSubtitleProxy: RemoteHLSSubtitleProxy.Prepared?
+
+    /// AE#984 R2: moves with every pick of an injected rendition, so a pick still waiting for its
+    /// sidecar sees that a newer one took over and never selects.
+    var injectedRenditionSelectGeneration: UInt64 = 0
 
     /// AE#616: measures how far AVPlayer's item time leads the presented frame on the bypass, off the
     /// injected renditions. Nil whenever `remoteHLSSubtitleProxy` serves none.
@@ -4312,6 +4405,21 @@ public final class AetherEngine: ObservableObject {
     var heldPictureAwaitsSoftwareHost = false
     /// Which route the last held picture came from, for the log line and the tests that pin it.
     var heldPictureLastRoute: String?
+    /// AE#1113: the outgoing picture a host keeps across its own next `load()`. A slot of its own, so
+    /// an audio-switch hold never lands on the host's surface and a load's release of that hold
+    /// leaves this one up. See `holdOutgoingPicture(on:)`.
+    weak var outgoingPictureView: AetherStillView?
+    var outgoingPictureWatches: Set<AnyCancellable> = []
+    var outgoingPictureTimers: [Task<Void, Never>] = []
+    var outgoingPictureToken = 0
+    var outgoingPictureShownAt: ContinuousClock.Instant?
+    var outgoingPictureSawNextFrame = false
+    var outgoingPictureLastRoute: String?
+    var outgoingPictureLastRelease: String?
+    /// How long the hold may stand after the next item's first frame before the engine takes it down
+    /// itself, and how long it may stand without one. Only tests change them.
+    var outgoingPictureGraceSeconds: Double = AetherEngine.heldPictureTimeoutSeconds
+    var outgoingPictureCapSeconds: Double = AetherEngine.outgoingPictureCapSecondsDefault
     /// The stand-in's playlist budget (`RemoteHLSSubtitleProxy.budgetSeconds`). Only tests change it:
     /// a test that holds the origin and stops the load mid-fetch races this clock, and on a loaded CI
     /// runner the fetch timed out first and the load mounted the origin instead.
@@ -5041,6 +5149,8 @@ public final class AetherEngine: ObservableObject {
                 ingest.setJoinsAtPlaylistStart(options.liveJoinsAtPlaylistStart)
             }
         }
+        // AE#1129: after the host limit above, which decides whether this origin takes a second reader.
+        attachmentReadPlan = resolveAttachmentReadPlan(options: options, url: url)
         // #170: the carryover is consumed by THIS load only (registration site below, or never on
         // the branches that return before it); it must not persist into loadedOptions where a later
         // host-initiated reload would resurrect a stale session snapshot.
@@ -5713,6 +5823,7 @@ public final class AetherEngine: ObservableObject {
                 throw error
             }
             startAtmosConfirmation()
+            startDeferredAttachmentRead()
             return sourceProbe
         }
 
@@ -6327,7 +6438,7 @@ public final class AetherEngine: ObservableObject {
             routedSoftware: useSoftwarePath, preferred: options.preferredDecodePath)
         // #846: after every other routing decision, because this one only ever adds the software path and
         // the interlace refute probe above can take that path away again.
-        let upscaleDecision = !options.upscalesLowResolutionVideo
+        let upscaleDecision = !options.upscalesLowResolutionVideo && !options.upscalesFullHDVideo
             ? UpscaleRouteDecision.notTaken(.preferenceOff)
             : upscaleRouteDecision(
                 options: options,
@@ -6630,6 +6741,7 @@ public final class AetherEngine: ObservableObject {
                 // #274: the 1000ms Stage 1 budget is the DV-cold-start bet on a sole-writer host's inbound
                 // write. Sessions no dynamic-range switch can reach (engine-writer, or SDR content) take the
                 // 200ms budget instead of paying it on every load.
+                let playGateEntry = DispatchTime.now()
                 await awaitingDisplaySwitch(generation: gen) {
                     await displayCriteria.waitForSwitch(
                         startGrace: Self.playGateGrace(
@@ -6645,6 +6757,10 @@ public final class AetherEngine: ObservableObject {
                         settleCap: options.isLive ? .standard : .awaitObservedEnd,
                         isCurrent: { self.loadGeneration == gen })
                 }
+                try checkLoadCurrent(gen)
+                // AE#1110: a host on the bare player layer has no AVKit view to activate at play().
+                await activateNativeAudioSession(
+                    "after the play gate, held \(Int((DispatchTime.now().uptimeNanoseconds - playGateEntry.uptimeNanoseconds) / 1_000_000))ms")
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded
@@ -6728,6 +6844,8 @@ public final class AetherEngine: ObservableObject {
         applyPreferredSubtitleSelection(startAnchor: startPosition, sourceDuration: sourceProbe?.durationSeconds)
         // #214 follow-up: opt-in JOC confirmation runs behind the session, never in front of the first frame.
         startAtmosConfirmation()
+        // AE#1129: the Matroska attachments the open passed over, fetched once the first frame is up.
+        startDeferredAttachmentRead()
         return sourceProbe
     }
 
@@ -6952,6 +7070,12 @@ public final class AetherEngine: ObservableObject {
     /// producer's frontier. The cache keeps everything from the consumer's target up to the highest stored
     /// segment, so every fetch from there on is served or produced next, never a restart (which the origin
     /// cannot honour). An earlier, detached span would run into a segment that no longer exists.
+    /// AE#1117: the item-clock target of a VOD seek. The item axis starts at 0, so a target below it
+    /// means the first frame.
+    nonisolated static func vodItemSeekTarget(sourceSeconds: Double, playlistShift: Double) -> Double {
+        max(0, sourceSeconds - playlistShift)
+    }
+
     nonisolated static func sequentialSeekStaysResident(
         target: Double,
         sequentialOrigin: Bool,
@@ -7187,7 +7311,13 @@ public final class AetherEngine: ObservableObject {
         // STC base so `target` (0-based, matching duration) lands on the source-PTS shift the producer subtracts,
         // i.e. clockTarget == the 0-based playlist time (AE#105). Origin 0 off disc, so this stays
         // `target - playlistShiftSeconds` for normal VOD; SW/audio hosts run on source time (shift 0), no-op.
-        var clockTarget = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin) - playlistShiftSeconds
+        // AE#1117: clamped like the live branch. A source whose first keyframe comes after its first
+        // timestamp puts display 0 below the item axis (-2.104 s on the reported IPTV catch-up), and no
+        // item time down there exists; the AE#412 repair read that as a landing without a keyframe and
+        // re-cut seg0, which a sequential origin answers by failing the session.
+        var clockTarget = Self.vodItemSeekTarget(
+            sourceSeconds: PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin),
+            playlistShift: playlistShiftSeconds)
         // AE#418 round 2: AVPlayer throws a sub-second axis offset away at a seek and snaps back to
         // the playlist; a larger one it carries through unchanged (measured with `play
         // --picture-probe`: -0.500 and -0.875 read `axisErr=0.000` after a seek, -1.000 through
@@ -7806,9 +7936,9 @@ public final class AetherEngine: ObservableObject {
         // #170: the session a latched rendering request targeted is gone. Requests for a reload in
         // flight land at suspension points after the load's prologue, so they survive.
         pendingNativeRenderingRequest = nil
-        externalNativeStoreFillTask?.cancel()
-        externalNativeStoreFillTask = nil
+        externalNativeStoreFillQueue.cancel()
         resetSubtitleOCRState()   // Phase D: new session, new axis
+        resetBitmapTextRecognition()   // AE#1114
         remoteHLSSubtitleDiscoveryTask?.cancel()
         remoteHLSSubtitleDiscoveryTask = nil
         audibleReadbackTask?.cancel()
@@ -7823,6 +7953,8 @@ public final class AetherEngine: ObservableObject {
         detachRemoteHLSCueClock()   // AE#616
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
+        // The side read that fills them (AE#1129) belongs to the item for the same reason.
+        cancelDeferredAttachmentRead()
         fontAttachments = []
         // Container chapters belong to the source URL, not to the pipeline: the internal reopens of the same
         // source (audio switch, iOS background return, #127 expiry) run through stopInternal without
@@ -7868,6 +8000,7 @@ public final class AetherEngine: ObservableObject {
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
         cancelPendingAudioSelection()
         releaseHeldPicture(reason: "stop")
+        releaseOutgoingPicture(reason: "stop")
         nextLoadRequestsInPlaceItemHandover = false
         stopInternal(resetDisplayCriteria: resetDisplayCriteria,
                      finalTeardown: finalTeardown ?? resetDisplayCriteria,
@@ -9281,6 +9414,10 @@ public final class AetherEngine: ObservableObject {
         // block for ~0.5 s on a MAT passthrough route. The caller must declare an actual final teardown;
         // the host opt-in (deactivatesAudioSessionOnStop) goes to SharedOutputCoordinator.leave, and the
         // release belongs to the last engine out.
+        if finalTeardown {
+            // Sodalite#256: queued ahead of the release below, while the session is still active.
+            releaseRendererChannelPreference(reason: "final teardown")
+        }
         if finalTeardown && !keepNativeHost {
             let coordinator = SharedOutputCoordinator.shared
             let label = coordinator.label(for: ObjectIdentifier(self))
@@ -9361,6 +9498,7 @@ public final class AetherEngine: ObservableObject {
         cancelSidecarTask()
         stopSubtitleDrainer(reason: .sessionStopped)   // #112 rework: both channels
         resetSubtitleOCRState()                // Phase D
+        resetBitmapTextRecognition()           // AE#1114
         subtitleDrainTargets.removeAll()
         softwareSubtitlePacketStore = nil
         activeEmbeddedSubtitleStreamIndex = -1

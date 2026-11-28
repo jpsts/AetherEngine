@@ -15,6 +15,7 @@ Which file owns what, folder by folder. Paths are relative to `Sources/AetherEng
 | `AetherEngine+ClosedCaptions.swift` | In-band CEA-608 closed captions and A53/SEI extraction: `ClosedCaptionTap` (read-only producer observer) plus cue mirroring (#77, #131). |
 | `AetherEngine+Live.swift` | Live window publishing, edge snap, resume clamp, scrub thumbnails. |
 | `AetherEngine+Diagnostics.swift` | Memory probe and live-telemetry bridge. |
+| `AetherEngine+DeferredAttachments.swift` | AE#1129: `AttachmentReadPlan` (read a Matroska source's attachments at open, after the first frame, or never) and the side read that fetches them after the first frame and publishes `fontAttachments` and a cover. |
 | `AetherEngine+SubtitleDelivery.swift` | Emits the #357 subtitle-delivery line. See note. |
 | `AetherEngine+SubtitleResolution.swift` | Emits the #250 subtitle-resolution line. See note. |
 | `AetherEngine+AudioTap.swift` | Opt-in decoded PCM audio tap (#95): `installAudioTap()` returns the `AsyncStream` and picks native loopback, remote HLS or software mirror. |
@@ -33,6 +34,7 @@ Which file owns what, folder by folder. Paths are relative to `Sources/AetherEng
 | `FFmpegErrorConstants.swift` | AVERROR sentinels Swift cannot import from the C macros. |
 | `AetherEngine+LiveReopenURL.swift` | AE#1100: asks the host's `liveReopenURL` before a live URL is opened again, and publishes an in-place live audio switch. |
 | `AetherEngine+LiveSubtitleRenditions.swift` | Live: the upstream master's `EXT-X-MEDIA:TYPE=SUBTITLES` renditions as tracks (#359). See note. |
+| `AetherEngine+BitmapSubtitleText.swift` | AE#1114: the loop that reads the overlay's bitmap cues as text under `recognizesBitmapSubtitleText` and republishes each cue with `SubtitleImage.recognizedText`. Earliest unread cue first, dropped when its track changed meanwhile. |
 | `AetherEngine+SubtitleOCR.swift` | Arming, per-ordinal cursors and the MainActor tick of the bitmap-subtitle OCR worker. It fills a text rendition for PiP / AirPlay / external display while a PGS / DVB / DVD track's rendition is selected natively. |
 | `AetherEngine+AudioShaping.swift` | `setAudioShaping(_:)`: audio shaping as a live setting. Each change is a session-preserving rebuild, with presses folded into the one in flight (AE#923). |
 | `AetherEngine+TeletextPage.swift` | `setTeletextPage(_:)`: the teletext caption page as a live setting. Rebuilds the drain decoder of each channel showing a teletext track and leaves others alone, so a page libzvbi does not flag as a subtitle page can be fixed without leaving the channel (#364). |
@@ -57,7 +59,7 @@ Which file owns what, folder by folder. Paths are relative to `Sources/AetherEng
 | `AetherEngine+InterruptionGuard.swift` | F5: keeps a transport `play()` during an audio-session interruption from restarting a renderer path's clock. |
 | `AetherEngine+LiveAudioDrop.swift` | AE#641: a live channel whose audio the bridge builds but cannot decode plays video-only instead of stalling. |
 | `AetherEngine+RendererClockTestHooks.swift` | DEBUG-only hooks for the aetherctl `--host-calls stallclock` drill (AE#549): a master clock stopped by something other than the host. |
-| `AetherEngine+HeldPicture.swift` | Holds the current picture on a `HeldStillSurface` across an in-place item swap (audio-track switch), with a timeout if the next item never shows a frame. |
+| `AetherEngine+HeldPicture.swift` | Holds the current picture on a `HeldStillSurface` across an in-place item swap (audio-track switch), with a timeout if the next item never shows a frame. Also the host's own hold across its next `load()` (`holdOutgoingPicture(on:)`, AE#1113), a separate slot released by the host. |
 | `AetherEngine+CompositorPreview.swift` | `showScrubPreview(atSeconds:in:)` and `ScrubPreviewPlacement`: compositor-drawn scrub previews for DV Profile 5 / AV1 10.0. |
 | `AetherEngine+DualLayerOutputRoute.swift` | Session lifecycle of `DualLayerOutputRoute` (`LoadOptions.dualLayerRoute == .avPlayerOutput`): prepare, start, forward-buffer cap. |
 | `AetherEngine+EnhancementLayerProbe.swift` | `probeDolbyVisionEnhancementLayer` and `DolbyVisionEnhancementLayer`: FEL or MEL from a Profile 7 source's first RPU. |
@@ -101,14 +103,14 @@ Notes:
 | `AtmosConfirmationWorker.swift` | `LoadOptions.confirmAtmos`: after the session is up, runs the bounded JOC pass on a side demuxer, one E-AC-3 track at a time, and republishes `audioTracks` through a source-keyed ledger (#214). Declined on an origin limited to one request, `sequentialOrigin` and `heldSourceConnection`, rechecked per track. |
 | `AtmosDetectionProbe.swift` | Opt-in bounded E-AC-3 JOC decode pass behind `probeDetectingAtmos`: `AtmosDetectionOptions` caps, one decoder, no playback session (#214). |
 | `AudioAVPlayerHost.swift` | Audio-only path: bare AVPlayer host for whitelisted codecs. Owns the persistent per-player `MPNowPlayingSession` (tvOS / iOS). Publishes the rebuffer axis (`waitingToPlayAtSpecifiedRate` / `AVPlayerItemPlaybackStalled` after first play) that the engine folds into `isBuffering`. |
-| `AudioBridge.swift` | Native path: decode and re-encode per `AudioBridgeMode` (EAC3 5.1 default, or lossless FLAC opt-in) for source codecs that cannot stream-copy into fMP4. |
+| `AudioBridge.swift` | Native path: decode and re-encode per `AudioBridgeMode` (EAC3 5.1 default, or lossless FLAC opt-in) for source codecs that cannot stream-copy into fMP4. Packs 24-bit PCM itself for a layout FLAC cannot label (AE#1120). |
 | `AudioClockAnchor.swift` | Software path: sample-count PTS anchor so consecutive buffers line up exactly; re-anchors on >100 ms drift (AVSampleBufferAudioRenderer crackle, #89). |
 | `AudioDecoder.swift` | Software path: libavcodec → PCM → `CMSampleBuffer`, with channel-layout tagging that names the resampler's own order (#401). |
 | `AudioDecoderOptions.swift` | How every audible FFmpeg audio decoder opens: AC-3 and E-AC-3 without the stream's dynamic range compression (`drc_scale` 0), as Apple's decoder plays them. |
 | `AudioOutput.swift` | Software path: `AVSampleBufferAudioRenderer` + synchronizer (master clock). |
 | `AudioPlaybackHost.swift` | Audio-only path: FFmpeg demux and decode into `AVSampleBufferAudioRenderer` for codecs off the whitelist. |
 | `AudioTailPadding.swift` | Native path: writes silence in the delivered codec from where a title's audio ends to where its video ends, into the final segment at end of file, because AVPlayer ends an item when its audio runs out (AE#847). |
-| `SoftwareAtmosRoute.swift` | Software path: the pure choice of how a track's audio reaches the renderer (PCM decode, compressed E-AC-3 JOC, or TrueHD Atmos / DTS:X rendered into a bed as APAC or PCM), from codec, stream shape, live and `objectAudioRendering`. |
+| `SoftwareAtmosRoute.swift` | Software path: the pure choice of how a track's audio reaches the renderer (PCM decode, compressed E-AC-3 JOC, or TrueHD Atmos / DTS:X rendered into a bed as APAC, PCM or binaural stereo), from codec, stream shape, live and `objectAudioRendering`. |
 | `SoftwareAudioProducing.swift` | Software path: what the host asks of whatever turns an audio packet into renderer input. Implemented by `AudioDecoder`, `SoftwareEAC3Passthrough` and `SoftwareAPACProducer`. |
 | `LazyTapDecoder.swift` | The PCM decoder the audio tap reads on a producer that does not decode itself, opened on the first tap. Shared by the three software producers. |
 | `AudioSampleBuffers.swift` | The CMSampleBuffer builder (compressed packet or PCM) the software producers share. |
@@ -120,7 +122,9 @@ Notes:
 | `AudioRouteDescription.swift` | The audio route as one log fragment, shared by every host so native and software logs describe it in the same words. |
 | `AudioTranscodingBridge.swift` | Native path: the protocol the segment producer drives a bridge through. `AudioBridge` and `SpatialAudioBridge` implement it. |
 | `DTSXConfirmation.swift` | #744 follow-up: sets `TrackInfo.isDTSX` from the DTS:X decoder's verdict, kept beyond the session that produced it. |
+| `FLACChannelLabels.swift` | The channel layouts CoreMedia assumes for a FLAC track in fMP4, which reads no layout of its own, and whether a source's layout is one of them (AE#1120). |
 | `FLACStreamInfo.swift` | Reads the `STREAMINFO` blocksize fields CoreMedia keys FLAC on, and decides when CoreMedia would refuse or mistime the track (AE#764). |
+| `RendererChannelPreference.swift` | Sodalite#256: keeps the session's channel preference from before the first renderer write and hands it back when the last renderer path ends, so the next native title is not sent at the old channel count. Also steps a refused 7.1 preference down to 5.1 instead of leaving the output in stereo. |
 | `RendererClockResume.swift` | AE#549: what a renderer path's `play()` does with a clock the system stopped rather than the host. |
 | `RendererTimeline.swift` | AE#395: the renderer axis (source time minus `origin`) the renderers and their synchronizer run on. |
 | `ResamplerInputParameters.swift` | The input a `SwrContext` was built for, so a context is rebuilt when the frames feeding it change. |
@@ -130,11 +134,12 @@ Notes:
 
 | File | What it does |
 | --- | --- |
-| `AudioShaping.swift` | `AudioShaping` (channel cap, dialogue lift, compressor, loudness target, LFE level in the fold) and `AudioShapingState`: the host's request and the published answer (AE#923). |
+| `AudioShaping.swift` | `AudioShaping` (channel cap, dialogue lift, compressor, loudness target, LFE level in the fold, binaural) and `AudioShapingState`: the host's request and the published answer (AE#923). |
 | `AudioShapingMatrix.swift` | The cap, the centre lift and the LFE level as one libswresample remix matrix. |
 | `AudioShapingStage.swift` | The matrix, graph and loudness normalizer as one object for `AudioBridge` and `AudioDecoder`: rebuilds the graph when the source layout, the rate or the dialogue route changes, and carries the loudness measurement and the held tail across (AUD-203, AUD-207). |
 | `AudioShapingGraph.swift` | The libavfilter graph after the remix: dialoguenhance + pan on stereo, acompressor, alimiter, aformat. Runs on its own sample counter so its latency never reaches the timeline. |
 | `LoudnessNormalizer.swift` | The loudness target (AE#1036): BS.1770 integrated loudness over what has played, and the bounded, latency-free gain toward the target, applied in front of the graph. |
+| `BinauralRenderer.swift` | The headphone render: an offline `AUSpatialMixer` (ambience bed, headphone output type, no head tracking) that turns a labelled multichannel bed into binaural stereo, and the FFmpeg-to-CoreAudio channel label map it places the bed by. |
 
 ### `Audio/Normalization/`
 
@@ -153,7 +158,7 @@ Notes:
 | `AllocentricPanner.swift` | Constant-power point-source gains in the allocentric room model, TS 103 448 speaker targets. |
 | `TrueHDObjectAudioDecoder.swift` | LibTrueHD: the channel presentation plus the object presentation, without matrix interpolation. |
 | `DTSXObjectAudioDecoder.swift` | FFmpeg `dca` with `x_heights`: the 7.1 bed as coded plus the four heights and their folds. |
-| `SpatialBedOutput.swift` | `SpatialBedFormat` (PCM or APAC, and the route rule `.render` uses), the bed buffers and packets, and `PCMBedPacker`, the 24-bit PCM sink next to `APACEncodePipeline`. |
+| `SpatialBedOutput.swift` | `SpatialBedFormat` (PCM or APAC, and the route rule `.render` uses), the bed buffers and packets, `PCMBedPacker`, the 24-bit PCM sink next to `APACEncodePipeline`, and `BinauralBedSink`, which renders the bed binaurally before packing it as stereo. |
 | `SoftwareAPACProducer.swift` | Software path: TrueHD Atmos / DTS:X rendered into a speaker bed through `SpatialAudioBridge` as APAC or PCM, handed to the audio renderer as sample buffers. |
 | `SpatialSpeakerLayout.swift` | `SpatialSpeakerLayout` / `SpatialSpeaker`: the public speaker beds object audio is rendered into. |
 | `ObjectAudioRendering.swift` | `ObjectAudioRendering`: the public choice of how TrueHD Atmos and DTS:X are delivered (decode, render, layout). |
@@ -196,6 +201,7 @@ Notes:
 | `CCDataParser.swift` | Parses the bare cc_data triplet stream from a demuxable CEA-608 caption track (#77). |
 | `CEA608Decoder.swift` | In-house CEA-608 line-21 decoder (field 1 / CC1), checked against FFmpeg `ccaption_dec.c` (#77). |
 | `DeinterlaceFilter.swift` | Software path: persistent bwdif / yadif libavfilter graph; engages on the first interlaced frame. Under inverse telecine `fieldmatch` and `decimate` run around it (#853), on the GPU engine as their Metal ports after the upload, with the CPU filters before it as the fallback (AE#1108). |
+| `DeinterlaceTiming.swift` | Software path: `DeinterlaceTimingWindow`, the per-frame costs of the deinterlace graph on the decoder's thread (build, push, pull, copy out, decode), logged as `[Deinterlace] timing` every 240 input frames (AE#1112). |
 | `FFmpegDecoderContext.swift` | The one libavcodec decoder-context open (allocate, copy codecpar, configure, `max_pixels`, open, free on failure) behind the video, probe and subtitle decoders (audit DEC-R202). |
 | `EmbeddedSubtitleDecoder.swift` | Inline subtitle decode from demuxed packets. Opens DVB teletext with libzvbi_teletextdec text-format options (#107). |
 | `InterlaceProbe.swift` | Decodes a sample and applies the deinterlacer's own engagement test, so a declared field order that no frame backs up (PsF) stops costing a software decode (#232). |
@@ -351,9 +357,9 @@ Notes:
 
 | File | What it does |
 | --- | --- |
-| `AetherEngine+FrameExtractor.swift` | `makeFrameExtractor()` convenience for the currently loaded URL. |
+| `AetherEngine+FrameExtractor.swift` | `makeFrameExtractor()` convenience for the currently loaded URL, and `ExtractorYieldState`, the starvation gate every playback path arms (Sodalite#118). |
 | `DolbyVisionStillConverter.swift` | `DolbyVisionStillReshaping` trait. Applies the RPU-carried DV colour transform to a DV P5 / P10.0 base-layer frame (IPT-PQ-C2, not YCbCr), so scrub stills lose the green and magenta cast (#103). |
-| `FrameExtractor.swift` | Off-playback still extraction actor: serial decode queue, cancel-supersede, idle-close. |
+| `FrameExtractor.swift` | Off-playback still extraction actor: serial decode queue, cancel-supersede, idle-close. `StillOutcome` / `StillSource` tell a yielded still from a failed one. |
 | `FrameDecodeContext.swift` | Isolated FFmpeg demux + decode + sws_scale → `CGImage` (thumbnail / preview / snapshot). |
 | `FrameCache.swift` | Bounded LRU: stores isolated per mode, thumbnails bucketed by second. |
 | `FrameTypes.swift` | `FrameMode` (`.thumbnail` / `.preview` / `.snapshot`). |
@@ -405,7 +411,7 @@ On-demand MPEG-DASH (AE#859): one static Period, each representation a single `S
 
 | File | What it does |
 | --- | --- |
-| `AudioLookahead.swift` | Software live feeder: audio look-ahead pump policy and cursor state. Audio lead independent of video decode speed, live-edge underrun rebuffer (#107). |
+| `AudioLookahead.swift` | Software live feeder: audio look-ahead pump policy and cursor state. Audio lead independent of video decode speed, live-edge underrun rebuffer (#107), the clock rule and source wait of live without DVR (AE#1121). |
 | `Issue93ItemDeathRevive.swift` | Bounded revive budget (`ItemDeathReviveGate`) for items killed by accumulated -12889 media timeouts (`failedToPlayToEndTime`, #93 round 3). |
 | `MasterFallbackDecision.swift` | Pure master → media playlist fallback decision (#98, #130). Maps a master-rejection item failure (-11868 external SDR, -11848 HDR on SDR, -1002 all variants filtered at parse) to a reactive re-serve. |
 | `NativeAVPlayerHost.swift` | Native path: AVPlayer host bound to the loopback HLS-fMP4 URL. Awaits the real seek landing (deadline-bounded, first resume wins, #129) and hides the stale clock during a seek. |
@@ -423,8 +429,9 @@ On-demand MPEG-DASH (AE#859): one static Period, each representation a single `S
 | `RemoteHLSIngestFallback.swift` | Moves a bypass session onto the live-ingest loopback when the master advertises HEVC / DV / AV1 but delivers MPEG-TS, a carriage AVFoundation builds no video track for (#168). |
 | `RemoteHLSMasterRewrite.swift` | Declares host-supplied sidecar subtitles as legible renditions on the bypass by rewriting the origin master, since media selection on an HLS asset comes only from the playlist (#316). |
 | `RemoteHLSSubtitleProxy.swift` | Puts a loopback origin in front of that remote master: two playlist GETs, a rewrite and a socket. Anything that does not line up keeps the plain origin URL (#316). |
-| `RemoteHLSSubtitleProvider.swift` | Serves only what the proxy injected (`/master.m3u8`, `/subs_N.m3u8`, `/subs_N_0.vtt`). The A/V variants still point at the origin, so no media byte moves off it (#316). |
-| `RemoteHLSReadinessDeadline.swift` | The terminal state the bypass never had: an origin that answers everything while AVFoundation can build no track from it, which no failure signal reports (#334). |
+| `RemoteHLSSubtitleProvider.swift` | Serves only what the proxy wrote (`/master.m3u8`, `/subs_N.m3u8`, `/subs_N_0.vtt`, and `/origin_variant.m3u8`, the variant the proxy already fetched, AE#1122). Segments and init still come from the origin, so no media byte moves off it (#316). |
+| `RemoteHLSResumeWarm.swift` | On a resume, asks the origin for the resume segment before the served variant goes out, with the requester's User-Agent, so a transcoding server starts its job once, at the resume point (AE#1122). |
+| `RemoteHLSReadinessDeadline.swift` | The terminal state the bypass never had: an origin that answers everything while AVFoundation can build no track from it, which no failure signal reports (#334). Its budget comes from `LoadOptions.nativeRemoteHLSReadinessBudgetSeconds` (AE#1123). |
 | `RerouteVerdictMemory.swift` | Bounded, expiring memory of master URLs whose carriage watchdog fired, so a retune after an ingest death lands on the working path instead of paying for a full mount plus grace again (#199). |
 | `SWClockAnchorPolicy.swift` | Where the software demux loop anchors the synchronizer clock on the first decoded sample: as-is for files and resumes (the intrinsic A/V lead-in survives), at the sample for a source joined mid-stream (#107). A sample behind the anchor is resume preroll and never moves it (AE#724). |
 | `SWKeyframeSnap.swift` | Where a seek on the software host's AV1 through dav1d lands: the keyframe nearest its target, within 10 s and never across the playhead, from the packet cache's retained keyframes and the container's index. Exact when neither reaches the target (Matroska Cues arrive only with a demuxer reposition). `AetherEngine.snapsAV1SeeksToKeyframes` turns it off for comparisons. |
@@ -445,7 +452,7 @@ On-demand MPEG-DASH (AE#859): one static Period, each representation a single `S
 | `SoftwareAudioPacketCoverage.swift` | Audio coverage from exact decoded sample geometry where the codec allows it. |
 | `SoftwarePacketCacheTiming.swift` | A separate presentation axis for packets whose PTS the AVI MPEG-4 repair withholds, qualified against the decoder's own frames. |
 | `SoftwareReadAdmission.swift` | Read generations: packets, EOF and errors of a superseded seek or stop are rejected. |
-| `SoftwareEndOfMediaClock.swift` | AE#374: stops the software master clock at end of media so `currentTime` does not walk past `duration`. |
+| `SoftwareEndOfMediaClock.swift` | AE#374: stops the software master clock at end of media so `currentTime` does not walk past `duration`. Also decides when the end stops waiting for a parked video tail that lies behind the clock. |
 | `LiveAudioSelection.swift` | AE#1100: the audio track the software live feeder plays, swapped in place by an audio pick; also which other tracks the reader stores in the ring. |
 | `SoftwareLiveJoinPolicy.swift` | Where a software live session starts playing once the connect burst has landed, and the holdback behind the edge. |
 | `DirectLiveAudioReadAhead.swift` | Software live without a DVR feeder: a forward-only read-ahead on the one existing source connection. |
@@ -493,7 +500,9 @@ Live recording (AE#560): `AetherEngine+Recording.swift` starts it; these files c
 
 | File | What it does |
 | --- | --- |
+| `ASSHeaderEvents.swift` | Lifts the `Dialogue:` lines a muxer left in an ASS track's CodecPrivate out of the header, as Matroska-block payloads the session decodes like packets (AE#1127). |
 | `ASSScriptBuilder.swift` | Rebuilds raw ASS event cues + `TrackInfo.assHeader` into a complete script for whole-file renderers. |
+| `ExternalSubtitleFillQueue.swift` | Runs the whole-file decodes of load-declared sidecars into their native stores, one at a time, the picked track first. Shared by the loopback session and the `nativeRemoteHLS` stand-in (AE#984). |
 | `ExternalSubtitleTrack.swift` | Host-facing descriptor for external subtitle files registered as first-class tracks (synthetic `TrackInfo` ids, #88; `sourceStreamIndex` addresses one stream of a container URL, #266). |
 | `Issue100PGSStaleArrival.swift` | Holdback (`PGSStaleArrivalGate`) for PGS cues that arrive behind the playhead (#100). See note. |
 | `MovTextSampleBuilder.swift` | Stateless ASS/SSA → plain-text cleaner for cue bodies, used by `WebVTTBuilder` when serving a native rendition. The name predates the in-band tx3g path, which did not conform to HLS and is gone. |
@@ -509,7 +518,7 @@ Live recording (AE#560): `AetherEngine+Recording.swift` starts it; these files c
 | `SideReaderLoop.swift` | The read step (EOF told from a transport error) and the link-yield valve both subtitle side readers share (audit SUB-201, SUB-R201). |
 | `SideReaderLinkPolicy.swift` | Who gets the source link when the video path and a subtitle side reader both want it. On Matroska a "subtitle-only" reader still pulls every block off the wire, so the video path has priority, with a bounded grace and a yield ceiling (#240). |
 | `PQSubtitlePalette.swift` | Converts a PQ-coded PGS palette entry (UHD Blu-ray HDR) to sRGB against the BT.2408 graphics white, applied per display set on a PQ source (#1006). |
-| `SubtitleImageOCR.swift` | On-device recognition of bitmap subtitle images (PGS / DVB / DVD) into plain-text cues for the native rendition. Lossy by design; the fullscreen overlay keeps the pixel-accurate bitmaps. |
+| `SubtitleImageOCR.swift` | On-device recognition of bitmap subtitle images (PGS / DVB / DVD): plain-text cues for the native rendition, and the lines with confidence and box for the overlay's `recognizedText` (AE#1114). One process-wide recognition thread for both. Lossy by design; the fullscreen overlay keeps the pixel-accurate bitmaps. |
 | `SubtitleOCRPendingState.swift` | End resolution for pending compositions in the OCR worker, matching the sidecar rules: a composition still open at the next composition or clear event ends at that event's PTS. |
 | `WebVTTCueSettings.swift` | WebVTT cue settings (`line`, `position`, `align`) mapped onto `SubtitleTextPlacement`. libavcodec's decoder drops them from the ASS line it builds; the demuxer keeps them as packet side data (#233). |
 | `WebVTTSegmentParser.swift` | One parsed WebVTT segment of a live SUBTITLES rendition. Cue times are in the segment's own local clock (a counter providers run for days), and placement comes from the playlist geometry rather than the `X-TIMESTAMP-MAP` the spec offers (#359). |
@@ -531,6 +540,9 @@ Notes:
 | File | What it does |
 | --- | --- |
 | `HLSVideoEngine.swift` | Native path: session orchestrator (start/stop, producer construction and restart, shift handling). |
+| `PictureArea.swift` | `PictureArea`: where the picture sits inside a frame with bars painted in, normalized, with the snapped cinema ratio (Sodalite#118). |
+| `PictureAreaDetector.swift` | Finds the bars in one frame and unions many frames into a `PictureArea`. Dark frames are dropped, never read as bars. |
+| `PictureAreaScanner.swift` | Samples a title's keyframes (first pass, then a look-ahead ahead of the playhead) into a `PictureArea` that only grows. |
 | `KeyframeStillLadder.swift` | Native VOD: which keyframe the sparse scrub-still ladder reads next (one a minute, then every 30 s, nearest the playhead first; with an I-frame rendition served, every segment within 30 of the playhead's before that, read back to back) and whether the origin is idle enough to read it (nothing in flight or queued, no recent refusal, 30 s buffered). Lets `scrubPreviewFrame` answer beyond the resident window on a one-connection plan. |
 | `HLSVideoEngine+AudioRoute.swift` | Native path: audio cascade of stream-copy, then `AudioBridge` (E-AC-3 above stereo by default, FLAC with `.lossless`, or the object-audio bed through `SpatialAudioBridge`), then video-only. |
 | `HLSVideoEngine+SegmentPlanning.swift` | Native path: keyframe / uniform segment plans, extradata and AAC fixups. |
@@ -624,7 +636,9 @@ Notes:
 | `FrameToneMapper.swift` | #957: the per-frame picture processing stage: a frame chain with the tone map, rebuilt for a frame's own metadata, with the overrun and HDR10+ switch-off. |
 | `BT2390ToneCurve.swift` | AE#957: the BT.2390 tone curve from a source peak to a target peak on PQ values (the CPU reference), the PQ conversions, which source value sets the peak (`ToneMapSourcePeak`), and the curve's shader parameters. |
 | `FrameChainOutput.swift` | AE#957: `FrameChainColorVolume`, the colour volume a frame chain stage declares for its output, and the attachments a chain's output buffer carries (the source's, minus its geometry, with the declared HDR10 metadata). |
-| `UpscaleRouteDecision.swift` | Whether and how a load upscales: source geometry, the plan, and process-wide failure and cost memory. |
+| `UpscaleRouteDecision.swift` | Whether and how a load upscales: source geometry, the plan, which scaler each source size gets (`UpscaleSizePolicy`), and process-wide failure and cost memory. |
+| `ChromaSiting.swift` | Where a 4:2:0 buffer's chroma sits, from its chroma location tag (untagged is left), as the frame chain, the MetalFX conversion and Lanczos read and write it, plus the Metal functions both shader libraries share for it. |
+| `LanczosTaps.swift` | The Lanczos-3 taps of one resample axis (first source index and six normalised weights per output sample), which `LanczosPlaneScaler` uploads. Pure, so its tests run in the simulator too. |
 | `VideoProcessingRouteDecision.swift` | #957: whether a load takes the picture processing route, the plan (curve and declared metadata), and the process-wide failure memory. |
 
 ### `Video/FelCurves/`
@@ -648,6 +662,7 @@ The `Dovi*` files build only with the `DualLayerDolbyVision` trait.
 | `FrameChain.swift` | The GPU frame chain (AE#957, AE#1039): a decoded 8 or 10-bit 4:2:0 frame to half-float RGB, through a list of `FrameChainStage`s, and back to the input's format at the target size, in one command buffer. `PassThroughStage`, `ToneMapStage` (BT.2390, which also runs inside the one round-trip kernel) and `LineArtStage` are its stages; `FrameUpscaler` runs it for the `.lineArt` plan. A chain of identity stages at its own size runs as one kernel without the RGB texture (four luma samples per access where the width allows). Each stage declares its output's colour volume, and `attach` writes the frames' HDR10 metadata from it. |
 | `MetalFrameIO.swift` | The Metal plumbing the GPU frame stages share: plane textures from one texture cache, a dispatch that falls back to whole threadgroups on GPUs without non-uniform ones (A10X), `MetalTextureLease` (a frame's textures with their cache, held until its work is done) and `MetalPipelineCache` (pipelines per device, failed builds kept for a retry interval or for good). |
 | `LineArtShaderSource.swift` | Generated (`Scripts/generate-line-art-shader.py`) from Anime4K's Upscale CNN x2 (S), MIT: four half-precision convolution kernels and the depth-to-space kernel, compiled at runtime. |
+| `LanczosPlaneScaler.swift` | `UpscaleScaler.lanczos`: Lanczos-3 on the luma and chroma planes of a 4:2:0 frame, rows then columns into a float texture, rounded to the plane's codes. `FrameUpscaler` runs it for the `.lanczos` plan. Its kernels (`LanczosShaderSource`) compile at runtime. |
 | `UpscaleShaderSource.swift` | NV12 / RGBA kernels around MetalFX for the automatic upscale stage, and the Y'CbCr matrix from a buffer's tag. |
 | `DoviFelChromaFormat.swift` | Chroma sampling of the composed frame: 4:2:0 (the composition), 4:2:2 and 4:4:4 (experimental, `AETHER_FEL_CHROMA`), and each format's CoreVideo layout. |
 | `DoviFelComposer.swift` | BL + EL + RPU composition: pipelines compiled at runtime, pooled P010 output, `composeAsync` bounded at `maxFramesInFlight` with completions on its own serial queue; RPU → `DoviMetalParams` parsing. |
@@ -666,9 +681,10 @@ Notes:
 
 | File | What it does |
 | --- | --- |
-| `AetherPlayerView.swift` | One view for both paths: hosts either `AVPlayerLayer` (native) or `AVSampleBufferDisplayLayer` (software). |
-| `AetherStillView.swift` | Public transparent surface a host using AVKit binds (`bindStillView(_:)`), so a picture can be held across an item swap. |
-| `HeldStill.swift` | `HeldStillSurface` and the presenter that shows and clears a held picture on it (AE#711). |
+| `AetherPlayerView.swift` | One view for both paths: hosts either `AVPlayerLayer` (native) or `AVSampleBufferDisplayLayer` (software). Applies the fill zoom as a sublayer transform. |
+| `PictureFillGeometry.swift` | The zoom that makes a part of the picture cover a view, the plane rect after it, and the anchor / y-up adaptation (Sodalite#118). |
+| `AetherStillView.swift` | Public transparent surface a host using AVKit binds (`bindStillView(_:)`), so a picture can be held across an item swap. Also the tile a host passes to `holdOutgoingPicture(on:)`. |
+| `HeldStill.swift` | `HeldStillSurface` and the presenter that shows and clears a held picture on it (AE#711). On an `AetherStillView` each still gets an autoresizing subview of its own, so it follows the view's animated frame (AE#1113). |
 | `AetherScrubPreviewView.swift` | Public scrub preview surface for DV Profile 5 / AV1 10.0, played through its own muted `AVPlayer`. |
 | `PictureInPictureAreaTracker.swift` | macOS: follows the system PiP window's size for a software session so the display layer fits it (AE#810). |
 
@@ -710,7 +726,7 @@ Every subcommand is listed with its flags in [docs/cli.md](cli.md#subcommands-at
 | `AudioTapCmd.swift` | `audiotap`. |
 | `BackgroundAudioCmd.swift` | `bgaudio`. |
 | `CustomIO.swift` | `customio`. |
-| `LiveSpoolIO.swift` | `customio --live` (AE#445): a host-owned live spool behind `MediaSource.custom`. |
+| `LiveSpoolIO.swift` | `customio --live` (AE#445): a host-owned live spool behind `MediaSource.custom`; `--vod-sequential` loads it as a closed recording (AE#1117). |
 | `SMBTestCommand.swift` | `smbtest`. |
 | `LiveCmd.swift` | `live`, plus its high-bitrate seed generation. |
 | `LiveFixture.swift` | The synthetic, never-ending MPEG-TS source behind `live`. |

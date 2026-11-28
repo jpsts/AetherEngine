@@ -12,6 +12,312 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.77.0] - 2026-11-28
+
+### Added
+
+- **A fill that zooms past bars painted into the picture (Sodalite#118).** A 2.39 film delivered as a 16:9
+  file has its black bars in the frame, so `.resizeAspectFill` had nothing to crop. `PictureAreaScanner`
+  samples keyframes through `FrameExtractor` and returns where the picture sits (`PictureArea`, snapped to a
+  cinema ratio). Its look-ahead keeps sampling ahead of the playhead, and the area only grows, so a film with
+  IMAX passages ends at 16:9 instead of losing picture. `setFillPictureArea(_:animated:)` zooms the bound
+  `AetherPlayerView` so that area covers it, and `PictureFillGeometry` has the same math for hosts that
+  render through AVKit. `FrameExtractor.thumbnailOutcome(at:maxWidth:)` tells a still that yielded to
+  playback from one that failed.
+
+### Fixed
+
+- **Stills yield to a starved pipeline on every path (Sodalite#118).** Only the native loopback session armed
+  the extractor's yield gate. On a remote HLS transcode and on the software host, session-coupled stills
+  read the original file unthrottled, on a transcode over the line that was already too thin for it. Both
+  paths now arm it. On the software path a paused tick counts as healthy, and a playing one needs a decoded
+  cushion, 4 MB of reader runway (not on live, where the edge caps it) and no rebuffer, so stills stand back
+  before a thin line stalls. A seek or a load leaves the gate as it was instead of holding previews back.
+
+- **Go Live on a software-path channel no longer lands past the newest media after a native live session
+  (AE#1135).** The native path's 1 Hz live window timer ran one more pass after the stop cancelled it. By
+  then the next load had already set up its own live window, so that pass wrote the previous channel's
+  seekable end into it. The edge only ever grows, so it stayed there. In the report it sat at 398 s while
+  the software ring held about 302 s, and `seekToLiveEdge()` froze the picture for 95 s while the source
+  caught up. A timer pass now ends with the session that started it, and the software host's edge
+  callback only publishes while that host is still the engine's.
+- **A constant-rate Matroska track that drifts off the frame grid no longer hitches every few seconds
+  (PR #1139).** A track whose frame is a hair longer than the standard rate's (41.70839 ms against 41.70833
+  on a Blu-ray remux) left the AE#886 grid a few minutes in, and the first frame of a fragment then landed a
+  frame early. The grid now checks each frame against a band the segment's first frame opens, so a drifting
+  track stays on it. A 12-minute resume into a test file drifting 3.6 ms went from 0 of 1632 frames on the
+  grid to all of them, and a restarted producer writes the same presentation times as a continuous one.
+- **A sequential origin no longer fails at the start of a seek to 0 (AE#1117).** On an IPTV catch-up whose
+  first keyframe came 2.1 s after its first timestamp, a seek to 0 issued during the load reached the
+  first segment at item time -2.1 s. The AE#412 repair then asked for a restart to re-cut that segment,
+  and a sequential origin answers every restart by failing the session (`Source cannot be repositioned`,
+  code -5), within 4 s of the start. A VOD seek target now stops at the start of the item, as a live one
+  already did, and the repair leaves a sequential origin alone, since it has no restart to repair with.
+- **A stereo title after a software-path title no longer goes out as multichannel PCM (Sodalite#256).**
+  The software and audio-only paths set the audio session's preferred channel count, and nothing set it
+  back. The value is process-wide, so the next title on AVPlayer inherited it. Measured on an Apple TV 4K
+  into a Sonos Arc, a stereo title after a 5.1 software title arrived as Multichannel PCM 5.1 every time,
+  until the app restarted. The engine now writes back the value from before the first renderer write when
+  the last renderer path stops, or when an engine moves on to a native title without stopping. With the
+  fix the same stereo title arrives as PCM 2.0, with and without `stop()` in between.
+- **7.1 on the software path reaches a 5.1 soundbar as 5.1, not stereo.** The Arc refuses a preference of 8
+  with error -50, and tvOS then stays in stereo instead of trying a smaller layout. A refused 8 now steps
+  down to 6, and the Arc shows Multichannel PCM 5.1.
+- **VC-1 and WMV3 decoded on several threads no longer read a reference row too early (FFmpegBuild
+  3.19.3).** Near the top edge of a picture, motion compensation could pass its wait before the reference
+  row it reads was decoded, on intact streams too. On damaged streams, error concealment could rewrite rows
+  another thread was already reading, and a repeated slice header could turn a B picture into a reference
+  picture. The frame threading patch is now at the fifth review round of FFmpeg PR 26273 (AE#1107).
+- **The engine builds without warnings under Xcode 27.2 again (AE#1140).** Six diagnostics that code added
+  since #1062 brought back: a mutable timing value captured by the ML upscaler's callbacks, two unused values
+  in the subtitle drain, a `weak self` inside a task that already holds `self`, and an inout pointer to a
+  generic value in the binaural renderer's property setter. A seventh, macOS only, was left in on purpose at
+  #1062: the PiP area tracker's `nonisolated(unsafe)` view, which the 27 SDK no longer wants and the 26 SDK
+  still needs. It now goes through a wrapper both accept. Nothing changes at runtime. Thanks to YangHanqing
+  for the report.
+
+## [7.76.0] - 2026-11-26
+
+### Added
+
+- **Binaural for headphones (`AudioShaping.binaural`).** A 5.1 or 7.1 source, or a rendered TrueHD
+  Atmos or DTS:X bed with its heights, plays as binaural stereo instead of a flat fold. Each channel
+  becomes a virtual speaker around the listener through Apple's `AUSpatialMixer` (HRTF, no head
+  tracking). The result is ordinary stereo PCM, so it works on any headphones, Bluetooth included.
+  On its own it keeps `objectAudioRendering`, so the heights reach the render. `aetherctl` takes it as
+  `--audio-shaping binaural`. See [formats.md › Binaural for headphones](docs/formats.md#binaural-for-headphones).
+
+### Changed
+
+- **VOD segments are served while they are written, by default (AE#1129).**
+  `LoadOptions.progressiveSegmentDelivery` is now `true`. AVPlayer starts on the first half-second
+  fragments of a segment instead of waiting for its cut, which matters when the first keyframe interval
+  is long: a file with keyframes at 0 and 10.7 s started after 5.8 s over a 25 Mbit/s link, and now after
+  2.8 s. Nothing changes on a source fast enough to cut segments before AVPlayer asks. Set the option to
+  false for the old behaviour; `aetherctl play --no-progressive-segments` does the same.
+
+### Fixed
+
+- **A finite software Live source ends even when its clock stopped behind the video tail.** Since the
+  dry-source rebuffer (AE#1121), the clock can be paused right at the end of a source. When it then did
+  not start again, the parked video stayed in a full renderer and the session kept reporting
+  `.playing`. The end now frees a parked tail that lies wholly behind the clock instead of waiting for
+  it.
+
+- **Upscaled and tone-mapped frames keep their colour on the right spot.** The frame chain (line art,
+  tone map), the MetalFX conversion and the Lanczos scaler treated every frame's chroma as centred.
+  Most video has it on the left luma column (the H.264 and HEVC default), so at 2x a colour edge came out
+  half a pixel beside its luma edge, and a same-size pass blurred hard chroma edges. They now read the
+  chroma where the frame's tag puts it, untagged as left, and write it back there. Software-decoded
+  frames now carry the stream's chroma location tag, as VideoToolbox's do.
+
+- **GPU deinterlaced frames no longer keep an earlier frame's color tags (FFmpegBuild 3.19.2).** The
+  VideoToolbox deinterlacers and the GPU inverse telecine reuse output buffers, and a reused buffer kept
+  the tags of the frame it last held, so an HLG transfer function could stay on later untagged frames.
+  The deinterlaced output also no longer claims to be interlaced (field count and field detail), and
+  full-range NV12 comes out in a full-range buffer instead of a video-range one. Both deinterlacer
+  patches are now at their reviewed upstream state (FFmpeg PR 26276 and 26244).
+
+- **Exact seeks on a media-playlist session no longer fetch 1 to 3 segments before the target
+  (AE#1128).** The engine opens AVPlayer on the media playlist whenever it needs no master, which is
+  most SDR H.264 films, and that playlist did not declare `EXT-X-INDEPENDENT-SEGMENTS` (only the
+  master did). AVPlayer then began every exact seek early to find a decodable start, more the longer
+  the GOP. A VOD media playlist on a keyframe-aligned plan now carries the tag, since every segment
+  of such a plan opens on its own keyframe. A plan without a usable index (MPEG-TS, a remote MKV
+  whose Cues could not be read) keeps the old playlist. On a 6 Mbit/s link with a 4 Mbit/s, 4 s GOP file, a seek to 60 s landed in 7.7 s instead
+  of 17 s (3 runs each). Live playlists are unchanged.
+
+- **A seek in the first seconds of a slow remote session no longer waits on a march it already
+  knows is too slow (AE#1128).** The provider decides between waiting for the running producer and
+  restarting it at the target from the measured march rate. A seek before the second segment was
+  sealed had no measurement, so it waited, and the measurement that arrived a moment later was never
+  read: the request held until AVPlayer timed it out and asked again. The wait is now decided again
+  at every segment the producer seals. Measured on a 30 Mbit/s H.264 + DTS file over a link at about
+  media rate, a seek to 30 s right after the start landed in 18.7 s instead of 26 s (4 runs each).
+  `aetherctl play` gains `--seek-after N` to put a seek that early.
+
+- **ASS tracks whose events sit in the track header now show their subtitles (AE#1127).** Some
+  Matroska muxers write every `Dialogue:` line of an ASS track into its CodecPrivate and no subtitle
+  blocks. libass reads them from there, so mpv showed the lines, but the engine only sees blocks and
+  delivered no cue at all (`packets=0`). The engine now lifts those lines out of the header at open
+  and feeds them to the session as packets, on the native and the software route, into the native
+  WebVTT rendition, and for sidecar containers. They are also removed from `TrackInfo.assHeader`, so
+  a host that renders the header with libass does not draw them twice.
+
+- **`.rebuffering` no longer shows up while the software clock is still running.** The software
+  host published `isRebuffering` before it paused the synchronizer, and the flag travels to the main
+  actor on its own hop, so a reader there could see the hold a moment before the clock stopped. The
+  pumps now pause the clock first and publish second, and on a resume they ask the clock to start
+  before they clear the flag. A resume that goes through the video preroll still starts the clock
+  up to a few seconds after the flag clears, as any start from a standing clock does. Found by a CI
+  test that read the clock right after the flag.
+
+## [7.75.0] - 2026-11-24
+
+### Added
+
+- **A host can give a slow remote-HLS start longer than 45 s (AE#1123).** The bypass ended a session
+  that showed nothing for 45 s with `.noPlayableTrackWithinBudget` (#334). A server transcode can need
+  that long for its first segment (a Jellyfin 4K HDR conversion took 45 s during a library scan), and
+  then the engine's error reached the viewer before the host's own start watchdog could fire.
+  `LoadOptions.nativeRemoteHLSReadinessBudgetSeconds` sets the wait per load. nil keeps 45 s, shorter
+  values are raised to 45 s (the carriage reroute needs that long), longer ones are capped at an hour.
+  `aetherctl play --readiness-budget` drives it. Requested by golfista.
+
+### Changed
+
+- **Matroska fonts are read after the first frame (AE#1129).** libavformat reads a file's attachments
+  while it opens, so the fonts of an ASS release sat in front of the first frame: 94 MB of them took the
+  start from 1.0 s to 12.1 s over a 68 Mbit/s link. The session's open now passes over them, and a second
+  reader fetches them once the first frame is up and playback has a 15 s cushion (they landed at 16.4 s,
+  playback did not stall).
+  `fontAttachments` is now `@Published` and fills after `load()` returns, and a Matroska cover reaches
+  `metadata` the same way. **A host that reads `fontAttachments` once at load has to observe
+  `$fontAttachments` instead**, or set the new `LoadOptions.readsContainerAttachmentsAtOpen` to keep the
+  old read at open. Live sources, a custom reader without an independent cursor, `sequentialOrigin`,
+  `heldSourceConnection` and an origin limited to one request keep reading at open by themselves.
+  `aetherctl play --attachments-at-open` drives the old path and prints when the fonts land.
+  Reported by zacaronii.
+
+- **AV1 software decoding uses dav1d 1.5.5 (FFmpegBuild 3.19.1).** It brings new AArch64 assembly for the
+  CDEF filters, `emu_edge` and 8-bit `ipred_filter`, faster film grain and palette decoding, and fixes in
+  error paths (a failed T.35 metadata allocation, tile state reallocation or frame task creation). The
+  dav1d API is unchanged.
+
+### Fixed
+
+- **Matroska fonts labelled `font/ttf` or `font/otf` no longer add up to 60 s of reading to the open
+  (AE#1129).** libavformat does not know these MIME types (MKVToolNix writes them by default), so it left
+  the fonts without a codec id, and the stream analysis kept reading until its 60 s window was full
+  while it waited for them to identify. On a 970 MB release with 14 fonts, over a 68 Mbit/s link,
+  that was 36.7 MB and 4.5 s before the first frame; it is now 256 KB and 0.22 s. The fonts themselves
+  are unchanged, and the `open timings` line counts the skipped ones as `attachmentsParked`. Reported
+  by zacaronii.
+
+- **A revive during startup keeps the resume position (AE#1126).** A VOD producer that died before the
+  first frame (a read error, a renewed credential, a muxer failure, the audio moov prime) was rebuilt at
+  the player's rendered position, which is 0 before anything renders. AVPlayer was mounted at the start
+  position and asked for a segment there, while the producer cut from the beginning of the file. The
+  revive now aims at the load's start position until the first frame. Reported by robertontheair.
+
+- **A full disk at startup ends the load with `.storageExhausted` instead of a hang at 0:00 (AE#1124).** A VOD
+  failure reported while the native session was still starting was dropped, because the session was
+  not mounted yet. The load then mounted it anyway, and AVPlayer waited forever with no error. Before
+  that, a full segment volume was revived twice at the player's position, which is 0:00 before the
+  first segment, so a resume lost its position. Now a full volume before the first stored segment ends
+  the session at once, and a failure reported during startup makes `load()` throw and publish its kind. A
+  track switch that rebuilds onto a full volume reports `.storageExhausted` too, not
+  `.audioTrackSwitchFailed`.
+
+- **A resumed server transcode on `nativeRemoteHLS` starts the transcode once (AE#1122).** AVPlayer
+  asks for the fMP4 init before the segment it resumes in. Jellyfin builds that init from a job at
+  position 0, then restarts the job at the resume point for the segment, and the init alone sat right
+  at AVPlayer's 3 s map timeout (`-12889 'No response for map'`). On a session with sidecar subtitles
+  the engine now asks for the resume segment first, with the player's own User-Agent, and hands AVPlayer
+  the variant playlist only after that. It also serves AVPlayer the variant it had already fetched, so
+  the origin sees one variant fetch instead of two (not when that variant answer set a cookie).
+  golfista measured the double start on Jellyfin 12.4 (init 2.9 to 3.75 s, then the segment 3.5 to
+  4.1 s). On my Jellyfin 12.2 test server the init and the resume segment came off disk in 0.04 s
+  on every run after the fix. Reported and measured by golfista.
+
+## [7.74.0] - 2026-11-24
+
+### Added
+
+- **1080p can be upscaled too, with Lanczos-3.** `LoadOptions.upscalesFullHDVideo` scales SDR 1080p to the
+  display. An Apple TV does that bilinearly on its own (measured on an A15), and Lanczos-3 keeps clearly more
+  detail: 94.0 against 85.5 VMAF NEG over 13 test scenes, MetalFX spatial at 92.1. It runs on the Y'CbCr planes
+  without an RGB round trip, 8 and 10-bit, about 3 ms per frame on an M1. Like the low-resolution option it
+  moves the title onto the software path, so it is a switch of its own. `UpscaleScaler.lanczos` is new, and a
+  line-art stage that overruns at 1080p or on 10-bit now falls back to it instead of switching off.
+  `aetherctl play --upscale-fullhd`, and a Lanczos case in `aetherctl bench`.
+
+- **A host can keep the outgoing episode's picture across its next `load()` (AE#1113).**
+  `holdOutgoingPicture(on:)` pauses, reads the frame on screen by the audio switch's routes (native, software,
+  Dolby Vision compositor or reshaped still, HDR kept), and shows it on an `AetherStillView` the host places.
+  The hold survives the load, a route change included, and stays up until `releaseOutgoingPicture()`, so the
+  host can shrink and fade it into an Up Next tile. `stop()`, a failed or cancelled next load and two safety timeouts
+  also take it down. It uses its own slot, so an audio switch never lands on the tile. The still now sits in
+  an autoresizing subview of the still view, so an animated resize carries the picture on the same curve.
+  An item that already played to its end now hands over its last frame too (it used to vend none).
+  Requested by secunit404.
+
+- **Bitmap subtitle cues can carry their text (AE#1114).** With `LoadOptions.recognizesBitmapSubtitleText`
+  on, the engine reads each PGS / DVB / DVD cue on the overlay path with on-device Vision and republishes it
+  with `SubtitleImage.recognizedText`: the lines top first, each with Vision's confidence and a box in the
+  picture, plus the language and model used. A host can then draw picture subtitles in the viewer's caption
+  style and keep the picture when the text is missing or unsure. No extra reads, since only cues the overlay
+  already decoded are read. Off by default. Requested by secunit404. Pieces Vision reads separately on one
+  baseline now join into one line, left to right, also in the native OCR rendition for PiP and AirPlay.
+
+- **The native path can activate the audio session after its play gate (AE#1110).** A host that shows the
+  native path through the bare `AVPlayerLayer` sets `nativeAudioSessionActivationEnabled = true`. The engine
+  then calls `setActive(true)` after the wait for the display mode switch and before `play()`, on fresh
+  loads and in-place reloads, the same point the software path uses since AE#1099. The remote HLS bypass,
+  which has no gate, activates right before `play()`, and resumes after an interruption reactivate. Off by default, so
+  hosts with `AVPlayerViewController` see no change. Requested by secunit404.
+
+- **`[Deinterlace] timing` says what the deinterlace graph costs the decoder's thread (AE#1112).** Every 240
+  input frames: push, pull and the copy out of FFmpeg's pool per input frame, the worst frame, this thread's
+  decode time, and the total against the input and output frame interval. Inverse telecine runs in the same
+  graph, so its line reads 240 in, 192 out against a 41.7 ms output interval. Diagnostics only, no picture or
+  routing changes. Requested by classicjazz.
+
+### Fixed
+
+- **A slow external subtitle no longer fails or stalls a server HLS stream (AE#984, round 2).** On the
+  `nativeRemoteHLS` path a picked sidecar rendition used to reach AVPlayer while the file was still
+  being fetched, and AVPlayer then got a 404 for it. Picked at load with a 40 s sidecar, the item failed
+  after about 30 s (`-12938`). Picked mid-play with a 100 s sidecar, AVPlayer stopped loading media
+  and never showed the cues. The engine now publishes the pick at once and hands AVPlayer the rendition
+  only when its file is in: the item plays from the start and the subtitles appear when the server
+  delivers them. Sidecars are fetched one at a time with the picked track first, the others only once
+  the item is ready, and a sidecar that failed is fetched again when it is picked again. On the loopback
+  path a sidecar rendition used to give up after 15 s and stay off for the session; it now waits for
+  the file too. Reported and measured by golfista.
+
+- **FLAC in 7.1(wide) and other non-default layouts no longer plays on the wrong speakers (AE#1120).**
+  CoreMedia reads no channel layout from a FLAC track in fMP4 and assumes the FLAC default for the
+  count, so a 7.1(wide) track played its front-of-centre pair on the side surrounds. Such a track now
+  goes out as 24-bit PCM in its own layout, which CoreMedia reads from the `chnl` box. That covers a FLAC
+  source in either bridge mode and a bridged one (DTS-HD MA, PCM) under `.lossless`. The FLAC bridge used
+  to fold those sources into the default layout, so the front-of-centre pair lost its own speakers. 5.1
+  with back surrounds keeps stream copy. Reported by yazcaleb.
+
+- **Software live without a DVR window rebuffers when the source falls behind (AE#1121).** Its clock used
+  to run past every sample the source had delivered. The sound stopped, every late frame was dropped, and
+  `playbackPhase` stayed `.playing` until the host reloaded. The loop now pauses the clock once the source
+  is dry and the audio lead is under 0.15 s, shows `.rebuffering`, and resumes at 2 s, the rule the DVR
+  feeder already had. On a paced 1080p25 TS origin a 6 s stall used to leave audio and video 3.5 s behind
+  the clock for the rest of the session. Now it costs one rebuffer and no dropped frame. A source that
+  delivers in exactly real time keeps its 2.5 s lead and never pauses.
+
+- **A rewind before the resume point no longer fetches the title again (AE#1109).** With the opt-in
+  whole-source prefetch, a seek before the first resident segment restarted the producer there, and it
+  then cut every resident segment again to the end of the source. It now parks in front of a resident run
+  that earlier producers wrote on the same timeline. On a 597 MB, 10 minute test file resumed at 300 s and
+  rewound to 0, the source traffic after the seek fell from 569 MB to 301 MB, which is the stretch that
+  had never been fetched plus a few MB of read window. Reported by samimt55.
+
+- **ASS drawings no longer show as rows of numbers.** An event in drawing mode (`\p1` and up, until
+  `\p0` or a bare `\p`) holds vector commands, which the plain-text and styled-run paths kept as
+  text, so anime typesetting boxes showed as "m 1554.65 51.38 l 1554.29 ...". That text is dropped
+  now, in the host cues, the native WebVTT renditions and mov_text samples alike. The tags are read
+  as libass reads them: `\p 1` draws, a `\p` inside `\t(...)` counts, and a `\r` reset does not
+  end drawing. PR #1111 by ChattyRS.
+
+- **A still extractor stops re-reading a source it cannot decode stills from (AE#1118).** When a
+  `FrameExtractor` open failed because of the source itself (no video stream, no codec parameters, or no
+  decoder for the video codec), every later thumbnail or preview request opened the source again, and over
+  HTTP each open re-read the header from the origin. During playback with scrub previews that was about 1.6
+  opens a second for the whole session, competing with playback for the origin. On a debrid origin a 4K
+  Dolby Vision remux then downloaded slower than real time and stalled. Now the first such failure is kept
+  for the life of the extractor, and later requests return nil without touching the source. The failure is
+  logged once when it is kept; the per-request line drops to verbose. Other open failures, including a
+  failed codec-parameter copy, are retried as before. A failure is kept only when the stream analysis ran to
+  its end or its limit: one cut short by a read error or a stop can also miss the video stream or its codec,
+  so it is retried. PR #1119 by robertontheair.
+
 ## [7.73.0] - 2026-11-22
 
 ### Changed

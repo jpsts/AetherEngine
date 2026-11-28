@@ -134,6 +134,8 @@ The producer follows the plan with `VODSegmentCutter`, a cut in decode order tha
 
 Background: [measurements.md, Segment cutting by decode time](measurements.md#segment-cutting-by-decode-time).
 
+**Both playlists say so.** A VOD media playlist on a keyframe-aligned plan carries `EXT-X-INDEPENDENT-SEGMENTS`, as the master always did. The engine hands AVPlayer the media playlist directly whenever it needs no master (most SDR H.264 films: no HDR, no subtitle or audio rendition). Without the tag there, AVPlayer assumed a segment could depend on the one before it and began every exact seek 1 to 3 segments early, more for a longer GOP. A seek to 60 s on 4 s segments asked seg13 instead of seg15 at a 2 s GOP, and on a 6 Mbit/s link a 4 s GOP file landed in 17 s instead of 7.7 s (AE#1128). A plan without a usable keyframe index (MPEG-TS, a remote MKV whose Cues could not be read, a sequential archive) does not carry it either. Its uniform grid opens a segment at the first keyframe past the boundary, up to a GOP late, so the frames before that keyframe sit in the segment before. Live playlists do not carry it, because a live cut can be forced (an ad seam) and a join starts mid-GOP.
+
 **Which timestamp "reaches" a boundary depends on the container.** The plan's boundaries are the container's own index entries, and containers disagree on what an entry means:
 
 - a mov/mp4 sample table holds decode times,
@@ -191,9 +193,32 @@ The case this covers: MPEG-TS timestamps are 33-bit and wrap around. When an MPE
 - the source tick is 0.1 ms or coarser, and
 - the frame rate probes as exactly a standard rate the tick cannot represent.
 
-It then uses a time base with one frame in whole ticks (1/24000 with 1001 ticks for 23.976, 1/24000 with 1000 ticks for 24), anchored at the stream's start time. `HLSSegmentProducer` moves each packet whose source-axis PTS lies within one source tick of a grid slot onto that slot (the DTS onto its own slot, never past the PTS), and rescales everything else as before.
+It then uses a time base with one frame in whole ticks (1/24000 with 1001 ticks for 23.976, 1/24000 with 1000 ticks for 24), anchored at the stream's start time. On the anchored grid, `HLSSegmentProducer` moves each packet whose source-axis PTS lies within one source tick of a grid slot onto that slot (the DTS onto its own slot, never past the PTS), and rescales everything else as before. The producers use the drift band described below instead of that one-tick test.
 
 The grid is derived once per session, before the first producer runs, from the stream's declared rate. So every producer of a session writes the same `init.mp4` timescale, and a restarted segment still matches its continuous twin.
+
+**A track that drifts.** A real track's frame is not always exactly the standard rate's. A Blu-ray remux can run a few hundred-thousandths of a millisecond long per frame, and that adds up to more than one source tick within minutes. Anchored at the stream's start, the grid then loses most of the track's frames:
+
+- They pass through unsnapped, between neighbours that still snap.
+- The fragments cut from that mix join a frame apart, so the first frame of a fragment lands on its neighbour and leaves a hole behind it.
+- AVPlayer counts no dropped frame. The picture hitches every few seconds.
+
+So each producer checks frames against the track's own band instead of the anchored slot (`CFRFrameGrid.Phase`):
+
+- The first frame of a segment opens the band: its offset from the nearest slot.
+- A later frame of the same segment snaps while all snapped frames of the segment stay within two source ticks of each other. Rounding spans one tick, and the drift inside one segment is hundredths of a millisecond.
+- A frame outside the band is irregular and keeps its own time.
+- A decode time snaps within two source ticks of the band's middle and never widens the band. The muxer's timestamp sanitizer keeps decode times rising.
+- Frames keep their own slot numbers, so the output time is still `slot × frame`, exact.
+
+Two guards keep the band from doing harm, because it can move a frame by more than a third of a frame:
+
+- **An irregular keyframe.** The segment's first frame is its keyframe. If the next frame does not fit, the keyframe stood alone, and the band opens once more on that frame. Without this, one keyframe 6 ms off would take its whole segment off the grid.
+- **Order.** A frame only snaps where it stays in presentation order with the segment's recent frames, snapped or not, and moves less than the smallest spacing the segment has shown. The second rule covers frames that have not come yet. Both matter only in a variable-rate stretch whose frames sit closer than three eighths of a frame, which a constant-rate track never has.
+
+The band starts empty at every segment. So what a segment writes depends only on that segment's packets, and a producer restarted at a segment writes it exactly as the continuous one did, however far the track has drifted. The one exception is 24p film, where the pulldown retimer decides which packets reach the grid, and its window carries history across segments. A phase shift from an edit or a joined file costs at most the rest of one segment, because the next one opens its own band.
+
+The first frame may open the band at most three eighths of a slot from the anchored grid (15.6 ms at 23.976). Further out it looks more like an irregular frame than like drift, so the band waits for the next frame. That also bounds what the grid does to A/V sync. A snapped frame sits at most about three eighths of a frame (plus two source ticks) from its own time. A track that drifts further passes through unsnapped until it is back within three eighths of the next slot, and then snaps one slot on. Each of those two switches shows once as one uneven frame step (about 57 ms instead of 41.7) and moves A/V sync by up to 15.6 ms. At the measured 6 ms an hour, the first switch comes after about two and a half hours.
 
 **When the declared rate is not a standard rate.** Then `SourceFrameRateMeasurement` fits the rate to the head packets that `find_stream_info` already queued (peeked, not consumed), and the load uses that instead (Sodalite#236). This matters because mkvmerge writes the first frame's duration as a track's DefaultDuration, so film carrying 2:3 pulldown timing declares 20 fps while it runs at 23.976.
 
@@ -248,6 +273,22 @@ Two things keep a Resume of a file without a keyframe index from paying the inde
 
 The producer parks once the segments it has written ahead of the consumer target fill that budget, and resumes as eviction behind the playhead frees room (`PrefetchDiskBudget`). So an opt-in prefetch follows the disk budget, not the source length.
 
+**A restart below a resident band stops at the band (AE#1109).** A backward seek past the first resident segment restarts the producer there. Once it reaches a resident run it could only reproduce, it parks instead of cutting the run again (`awaitResidentRunHandover`). Without this the forward park never held a whole-source prefetch, because its target sits thousands of segments below the head, and one rewind before a resume point fetched the rest of the title a second time (4.8 GB of a 6.7 GB film in the report).
+
+A segment counts toward such a run only when all of this holds:
+
+- An earlier producer wrote it with the same video shift, audio shift and audio delay as this one. The cache records that per segment at adoption (`SegmentLineage`), and a parked session (AE#1095) hands it on with the segments.
+- It is not the first segment of its epoch. That one may open below its boundary and has its leading pictures before the keyframe dropped, so the producer cuts it again and parks after it.
+- Its lineage is known. A plain `store` carries none.
+
+The run ends at the first hole or at the first segment that does not count. That segment is evicted while the consumer has not asked for it yet, so the consumer misses there and the provider restarts a producer at it, instead of serving it as the continuation of the kept run.
+
+The pump parks only when the run reaches at least 8 segments past its head, or the last plan index. That is the depth the provider uses to keep a producer for a resident backward target. When the consumer plays past the run's end, the provider restarts a producer there.
+
+The park lets go only for a gap in those 8 segments that the consumer has not reached yet. The provider waits on the active producer for an index that close to its restart point instead of restarting, so nobody else would fill it. A gap behind the consumer is an eviction behind the playhead, and cutting there would pull the band through a second time.
+
+The reader's open window still drains after the pump parks, a few MB in the measurements. On a 597 MB file resumed at 300 s and rewound to 0, the source traffic after the seek fell from 569 MB to 301 MB, and the 0 to 300 s stretch that had never been fetched is about 298 MB of that.
+
 **Where a restart seeks.** A non-disc VOD restart seeks to the exact IRAP stored in the segment plan, on the video stream's own timestamp axis, with that timestamp as the lower bound. A seek on the global time axis can land a whole GOP earlier on multi-stream MP4, and the producer then has to read forward to the IRAP, which is a long remote read (#191). Disc plans use folded multi-clip timestamps (one timeline across several clip files) and keep the global-time seek.
 
 **Restarts on a slow link.** These rules keep a slow remote source from turning one restart into many (#93):
@@ -259,6 +300,10 @@ The producer parks once the segments it has written ahead of the consumer target
 - The first producer of a resumed session anchors directly at the resume segment, instead of producing seg0 into an immediate teardown.
 
 **Holes in the cache.** Scrubbing leaves retained bands of segments with gaps between them, inside the cache's stored min/max index range. So an index inside that range is no proof the segment exists. A fetch inside the range waits (2 s) only when the active producer's forward march actually covers the requested index. Otherwise it restarts at once (#129).
+
+**A short forward jump waits only while the march is faster than a restart (#932, AE#1128).** A request 1 to 8 segments past the producer's front (`forwardWaitWindow`) can either wait for the running producer to get there or restart it at the target. `MarchRateTracker` measures how fast the producer seals segments, and the provider waits only while the march would arrive sooner than a restart costs (3 s until one has been measured in the session).
+
+A seek in the first seconds of playback comes before the march has two completions, so there is nothing to decide on and the request waits. That wait is decided again at every completion that lands while it lasts, so the first measurement can still turn it into a restart. Before AE#1128 the request held until AVPlayer timed it out and asked again: 5 s of a 14.5 s landing in the report, and 26 s against 18.7 s to land in the repro (`aetherctl play --seek-after`, see the CLI docs).
 
 ### Seek deadline and recovery
 
@@ -311,6 +356,20 @@ Restart latency explains itself in the log (#93):
 
 A slow read with all-zero counters means the wait happened before the read loop.
 
+### Serving a segment while it is written
+
+AVPlayer gets each VOD segment while the producer is still writing it, not after the cut (`LoadOptions.progressiveSegmentDelivery`, on by default since AE#1129).
+
+- The muxer flushes a fragment (a `moof` plus its `mdat`) about every 0.5 s (`HLSSegmentProducer.progressiveFragmentSeconds`). Without the option it holds up to 8 s.
+- The producer registers the segment's staging file with the cache as it opens it. The file is only appended to, then renamed as it stands when it is adopted, so a reader always sees a growing prefix of the final segment.
+- The loopback server answers with a chunked response and sends each fragment as it lands (`ProgressiveSegmentReader`). It ends at the seal.
+- A segment the producer abandons (restart, failed cut, teardown) ends its connection without the final chunk. AVPlayer then asks again instead of taking the partial bytes for a whole segment.
+- Each chunk sent counts as fetch activity for the #65 wedge watchdog. Otherwise one long transfer would read as AVPlayer having stopped fetching.
+
+Why it matters: a segment is cut at a keyframe, so its length follows the source's GOP. A file whose first keyframe interval is 10.7 s has a 10.7 s first segment, 11 MB at 8 Mbit/s, and without this AVPlayer showed nothing until all of it had crossed the link. On a fast source the segment is cut before AVPlayer asks and nothing changes.
+
+Cut points do not move, so every segment still opens on its own keyframe and the playlists still declare `EXT-X-INDEPENDENT-SEGMENTS`. Live, the remote HLS bypass and the software path do not use it.
+
 ### Keeping AVPlayer from timing out
 
 A request during a restart must never leave AVPlayer waiting in silence (#93). AVPlayer's media watchdog logs `-12889 "No response for media file"` after ~3.5 s without response headers. Holding the connection open does not help, and three strikes fail the item.
@@ -328,6 +387,16 @@ So a VOD serve still running at 2 s sends the response headers early: a `200` wi
 - The engine confirms the death through the same deferred window as the `.failed` KVO. It then reloads the item through the stage-2 chain (the engine's item-reload recovery) with the pause guard bypassed.
 - `ItemDeathReviveGate` caps this at 3 attempts per dead spot. Playback progress, or a user seek away, restores the budget.
 - The fresh item resumes only if the host's play intent says the viewer was playing. A paused title whose item dies (a tvOS screensaver taking the display is one way) is reloaded and stays paused.
+
+### Where a producer revive aims
+
+When a VOD pump dies (a read error, a refused credential renewed by the host, a muxer failure, the AE#222 audio moov prime), the engine rebuilds the producer at one spot. `consumerRecoveryTarget()` picks it, in this order:
+
+1. A seek the viewer asked for that never landed.
+2. The load's start position, while no frame has rendered yet. AVPlayer was mounted there and asks for a segment near it (AE#1126).
+3. AVPlayer's rendered position.
+
+Rule 2 is what keeps a resume. Before the first frame the rendered position is still 0, so a revive during startup used to restart the producer at seg0 while AVPlayer waited for a segment near the resume point. A sequential origin is the exception: its first producer reads from byte 0 anyway, so there is no start position to keep.
 
 ### End-of-item recovery
 
@@ -545,6 +614,12 @@ The native pipeline above is the **loopback** route: the engine demuxes, remuxes
 The `Native/RemoteHLS*` types cover what is left for the engine: media selection (`RemoteHLSMediaSelection`), the readiness deadline, the subtitle cue clock and the carriage watchdog (`RemoteHLSIngestFallback`), which notices when AVPlayer cannot play the stream's carriage and falls back to ingest.
 
 - **Local proxy, only when needed.** The engine puts its local server in front of the origin's master playlist for two reasons only (`RemoteHLSSubtitleProxy`). It can declare host sidecar subtitles as renditions in a master of its own (#316). It can relay the media through a URLSession the engine owns, so the host's TLS trust answer applies (`HLSOriginRelay`, AE#495). The two compose.
+- **The proxy serves the variant it fetched.** To learn the program's length, the proxy already reads the master's first variant playlist. With no relay in front, its master points AVPlayer at that copy (`/origin_variant.m3u8`, every URI made absolute) instead of the origin's, so AVPlayer does not fetch it again. On a Jellyfin transcode one variant fetch takes 0.8 to 1.8 s (AE#1122). A variant whose answer set a cookie stays at the origin: the proxy's session keeps that cookie, and AVPlayer would then ask for the segments without it.
+- **A resume asks for the resume segment first (AE#1122).** With a start position, AVPlayer requests the fMP4 init before the segment it starts in. A Jellyfin transcode builds that init from a job at position 0, then kills the job for the segment request and starts again at the resume point: two ffmpeg starts in a row. `RemoteHLSResumeWarm` turns the order around. The first request for the served variant waits until the origin has answered a GET for the resume segment (capped at 8 s), and only then goes out, so AVPlayer finds the init and the segment on disk.
+  - The warm sends the User-Agent of that variant request. Jellyfin names the job after the User-Agent too, so a warm with URLSession's own agent started a second job that AVPlayer never used. On AirPlay the variant request comes from the receiver, which is also the client that then asks for the segments.
+  - It only runs where it can help: a finished playlist with `EXT-X-MAP`, a single variant, a start past the first segment, and a segment that is not a byte range of a static file.
+  - It needs the proxy, so today it only runs on a session that declares text sidecars. Without the proxy there is no variant request to hold.
+  - AVPlayer on macOS waited out a variant held for 8 s and played (measured with the segment held at the origin). On tvOS that is not measured yet.
 - **No media bytes.** The engine sees none here. Recording and prewarm do not apply, a starved connection reads as `.rebuffering` rather than `.stalled`, and the audio tap fetches its own copy of the segments (`AudioTapHLSReader`).
 
 ### HLS ingest into the loopback

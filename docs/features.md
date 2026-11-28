@@ -42,7 +42,7 @@ The engine sends a format to hardware when the platform can decode it, and to it
 - **Interlaced H.264** goes to software, because AVPlayer does not deinterlace. On VOD (on-demand files, not live) the engine checks the declared field order against decoded frames. Progressive video that is only packed as interlaced therefore keeps hardware decode. While the host reports an AirPlay receiver that shows video, it plays natively instead, so the TV gets the picture (AE#1070).
 - **Deinterlacing** runs on the GPU (bwdif_videotoolbox, Metal, field rate by default; yadif_videotoolbox on older FFmpegBuilds), with a CPU bwdif fallback that runs the same algorithm.
 - **Inverse telecine** for hard-telecined NTSC film (the usual DVD of a film-shot series): a load-time sample finds the 3:2 pulldown, the fields are matched back into 23.976 fps film frames and the display is asked for 23.976 Hz, instead of deinterlacing (#853). See [formats › Inverse telecine](formats.md#inverse-telecine).
-- **Upscaling (opt-in):** `LoadOptions.upscalesLowResolutionVideo` scales SDR video below 1080p up to the display. It uses VideoToolbox super resolution, then MetalFX, and needs OS 26. HDR, Dolby Vision and AirPlay keep their usual route, and the upscaling stage never stops playback. For animation, `upscaleScaler = .lineArt` runs a line-art network instead, which also takes 1080p. See [api.md › upscalesLowResolutionVideo](api.md#upscaleslowresolutionvideo).
+- **Upscaling (opt-in):** `LoadOptions.upscalesLowResolutionVideo` scales SDR video below 1080p up to the display. It uses VideoToolbox super resolution, then MetalFX, and needs OS 26. HDR, Dolby Vision and AirPlay keep their usual route, and the upscaling stage never stops playback. For animation, `upscaleScaler = .lineArt` runs a line-art network instead, which also takes 1080p. `LoadOptions.upscalesFullHDVideo` scales SDR 1080p with Lanczos-3, where an Apple TV would scale bilinearly. See [api.md › upscalesLowResolutionVideo](api.md#upscaleslowresolutionvideo) and [upscalesFullHDVideo](api.md#upscalesfullhdvideo).
 - **Tone mapping (opt-in):** `LoadOptions.videoProcessing` maps an HDR10 title whose declared peak is above `targetPeakNits` down to that peak (BT.2390), and the frame tells the display the target, so it does not map a second time. It plays the title on the software path and needs OS 26. Dolby Vision, HDR10+, HLG and SDR keep their usual route. See [api.md › videoProcessing](api.md#videoprocessing).
 - **3D on visionOS:** an MV-HEVC second view and side-by-side or over-under frame packing (HEVC) play in stereo (`LoadOptions.stereoPresentation`). Other platforms play 2D. See [api.md › stereoPresentation](api.md#stereopresentation).
 - **Dolby Vision Profile 20** (Dolby Vision on MV-HEVC, Apple's 3D format) is offered in stereo on visionOS, which is not yet confirmed on a Vision Pro. Every other system plays its base view in 2D as Profile 5, with correct colour.
@@ -75,11 +75,12 @@ Stream-copied audio is passed on untouched. Bridged audio is decoded and re-enco
 | Handling | Codecs |
 | --- | --- |
 | Stream-copied, lossless | AAC, AC3, EAC3, FLAC, ALAC |
-| Bridged (decoded, then re-encoded: by default surround to EAC3 5.1 and stereo to lossless FLAC; with `audioBridgeMode = .lossless`, FLAC up to 7.1) | TrueHD, MLP, DTS, DTS-HD MA, MP3, MP2, Opus, Vorbis, LPCM (including Blu-ray and G.711), WMA (Standard, Pro, Lossless, Voice), Nellymoser, ADPCM-SWF, Speex, RealAudio (Cook, ATRAC3, Sipro, Lossless, 14.4 / 28.8), AMR-NB, AMR-WB, DVD LPCM |
+| Bridged (decoded, then re-encoded: by default surround to EAC3 5.1 and stereo to lossless FLAC; with `audioBridgeMode = .lossless`, FLAC up to 7.1, or 24-bit PCM for a layout FLAC cannot label) | TrueHD, MLP, DTS, DTS-HD MA, MP3, MP2, Opus, Vorbis, LPCM (including Blu-ray and G.711), WMA (Standard, Pro, Lossless, Voice), Nellymoser, ADPCM-SWF, Speex, RealAudio (Cook, ATRAC3, Sipro, Lossless, 14.4 / 28.8), AMR-NB, AMR-WB, DVD LPCM |
 
 - **Surround:** 5.1 and 7.1 with the correct `AudioChannelLayout`.
 - **Audio-only:** `LoadOptions.audioOnly` runs a lean pipeline with no video machinery.
 - **Audio shaping (opt-in):** `LoadOptions.audioShaping` / `setAudioShaping(_:)` add a channel cap, a dialogue lift, a night mode (compressor plus limiter), a loudness target that lifts quiet sources (-36 to -12 LUFS) and an LFE level for stereo downmixes on 2.1 systems. See [formats.md › Audio shaping](formats.md#audio-shaping).
+- **Binaural for headphones (opt-in):** `AudioShaping.binaural` renders 5.1, 7.1 and Atmos heights to plain stereo with a head-related transfer function (HRTF), so surrounds sound beside and behind you on any headphones, Bluetooth included. See [formats.md › Binaural for headphones](formats.md#binaural-for-headphones).
 - **Track loudness on audio-only sessions (opt-in):** `LoadOptions.normalizationGainDB` / `setNormalizationGain(_:)` apply a track's ReplayGain or server normalization gain, lifts included, behind a -1 dBFS limiter, on both the AVPlayer and the FFmpeg audio host. See [api.md › Track loudness on audio-only sessions](api.md#track-loudness-on-audio-only-sessions).
 - **Audio delay:** `setAudioDelay(_:)` corrects lip sync while playing, up to 2 s either way. See [api.md › Audio delay](api.md#audio-delay).
 - **Audio description:** `TrackInfo.isVisualImpaired` marks audio-description tracks.
@@ -105,6 +106,7 @@ TrueHD Atmos and DTS:X can keep their height channels. This is opt-in through `L
 - The engine builds a speaker bed (a fixed set of speaker channels, heights included) from the stream's own lossless 7.1, steered by its objects (TrueHD) or heights (DTS:X).
 - Layouts: TrueHD from 5.1.2 up to 9.1.6; DTS:X 7.1.4 and 9.1.6 (its four heights unfolded from the compatible 7.1); a smaller layout renders DTS:X as 7.1.4.
 - Output: the bed as lossless 24-bit linear PCM. tvOS wraps it in Dolby MAT for an Atmos receiver, and iOS spatialises it on AirPods.
+- With `AudioShaping.binaural` on (and nothing else shaped) the same bed, heights included, leaves as binaural stereo for headphones instead.
 - Over AirPlay it goes as Apple Positional Audio (APAC, a lossy encode). That holds on the loopback route (the engine's local server feeding AVPlayer) and on the software host alike. Needs OS 26.
 
 Details: [formats.md › TrueHD Atmos with heights](formats.md#truehd-atmos-with-heights) and [formats.md › DTS:X with heights](formats.md#dtsx-with-heights).
@@ -127,6 +129,7 @@ More:
 - **Native WebVTT renditions** (opt-in, `LoadOptions.prepareNativeSubtitles`): the engine hands AVPlayer one language-tagged rendition per text track, including external files declared at load. Subtitles then survive PiP, AirPlay and an external display.
 - **Two tracks at once:** `selectSecondarySubtitleTrack(index:)` adds an independent second track (embedded or external) for bilingual viewing. Its cues arrive in `secondarySubtitleCues`. See [guide.md › A second subtitle track](guide.md#a-second-subtitle-track-at-the-same-time).
 - **Subtitle offset reach:** `maximumSubtitleDelaySeconds` / `maximumSubtitleAdvanceSeconds` (or `maximumSubtitleOffsetSeconds` for both) keep enough bitmap history and lead for the offset range a host offers.
+- **Bitmap cues as text** (opt-in, `LoadOptions.recognizesBitmapSubtitleText`): each PGS / DVB / DVD cue comes back with the text Vision read in it, line by line with confidence and position, so a host can draw picture subtitles in its own caption style.
 - **Bitmap tracks in PiP / AirPlay.** Bitmap tracks (PGS, DVB, DVD, embedded and external .sup) join as OCR-fed renditions. OCR here is on-device Vision text recognition: it runs while the track is selected and fills a language-tagged text rendition. This is lossy by design; fullscreen keeps the pixel-accurate overlay.
 
 The host draws the overlay itself. See [formats.md › Subtitles](formats.md#subtitles).
@@ -189,6 +192,7 @@ How to wire it: [guide.md › Picture in Picture](guide.md#picture-in-picture). 
 ## Frames, metadata and the audio tap
 
 - **Frames:** the off-playback `FrameExtractor` has `thumbnail` (scrub preview) and `snapshot` (frame-accurate).
+- **Bars painted into the picture:** `PictureAreaScanner` finds where the picture sits inside a letterboxed or pillarboxed frame, and `setFillPictureArea(_:animated:)` zooms it to cover the view. See [api.md › Filling past bars in the picture](api.md#filling-past-bars-in-the-picture).
 - **Probing without playing:** `AetherEngine.probe(url:)` / `probe(source:)` read tracks, HDR and Dolby Vision format, container and disc titles without starting a session, with optional byte and time limits and cancellation. Opt-in passes settle Atmos, HDR10+ and the Dolby Vision enhancement layer. See [api.md › Probing without playing](api.md#probing-without-playing).
 - **Scan type:** `sourceVideoScan` tells a host 1080i from 1080p. See [api.md › Scan type](api.md#scan-type).
 - **Metadata:** `MediaMetadata` (title, artist, album, cover) is parsed on load. A container's album artist fills `artist` when there is no artist.

@@ -573,7 +573,8 @@ Other lines `play` prints:
 | `--start-position S` | Resume anchor, see [Shared flags](#shared-flags). Also judged, see [Resume landing](#resume-landing-ae724). | none |
 | `--paused` | Mounts with `autoplay = false`. | off |
 | `--host-calls <list>` | Replays host calls against the session. See [Host calls](#host-calls). | none |
-| `--seek-every N` | Seeks once every N ticks past tick 10. | off |
+| `--seek-every N` | Seeks once every N ticks past tick 10 (or past `--seek-after`). | off |
+| `--seek-after N` | The tick the seeks start after. | 10 |
 | `--seek-pattern <abs,...>` | Absolute targets `--seek-every` walks through. | a short backward hop |
 | `--seek-count K` | Stops after K seeks. | unlimited |
 | `--throttle-kbps N` | See [Shared flags](#shared-flags). | no cap |
@@ -588,6 +589,7 @@ Other lines `play` prints:
 | `--dvr-window N` | DVR ring size in seconds. See [Shared flags](#shared-flags). | none (live-only) |
 | `--live-ingest` | Loads through `HLSLiveIngestReader` as a custom source. | off |
 | `--native-hls` | `LoadOptions.nativeRemoteHLS`. | off |
+| `--readiness-budget SECONDS` | `LoadOptions.nativeRemoteHLSReadinessBudgetSeconds` (AE#1123): how long the bypass waits with nothing happening before `.noPlayableTrackWithinBudget`. Pair with `--native-hls`. | engine default (45 s) |
 | `--standard-join`, `--fast-zap`, `--live-cushion SECONDS` | Live join profile and cushion. See [Shared flags](#shared-flags). | `.fastZap`, engine default |
 | `--live-start-immediately` / `--no-live-start-immediately` | `LoadOptions.liveJoinStartsImmediately` (AE#440). | on |
 | `--live-join-at-start` | `LoadOptions.liveJoinsAtPlaylistStart` (AE#1090): joins at the oldest listed segment. Pair with [`hlsfixture --recording-backlog`](#a-recording-in-progress---recording-backlog). | off |
@@ -606,7 +608,9 @@ Other lines `play` prints:
 | `--subtitle-offset-reach SECONDS` | Sets `maximumSubtitleOffsetSeconds` before the load (0 to 600). | engine default |
 | `--subtitle-delay-reach SECONDS`, `--subtitle-advance-reach SECONDS` | Set `maximumSubtitleDelaySeconds` / `maximumSubtitleAdvanceSeconds` before the load (0 to 600), after `--subtitle-offset-reach` (AE#1031). | engine default |
 | `--preserve-ass-markup` | `LoadOptions.preserveASSMarkup`. | off |
+| `--bitmap-text` | `LoadOptions.recognizesBitmapSubtitleText` (AE#1114). The cue log prints a `TEXT` line per bitmap cue read. | off |
 | `--skip-attachments` | `LoadOptions.skipsContainerAttachments` (AE#956). | off |
+| `--attachments-at-open` | `LoadOptions.readsContainerAttachmentsAtOpen` (AE#1129). | off |
 | `--iframes` | `LoadOptions.serveIFramePlaylist` (AE#682) on a full session, where the still ladder prefetches into the rendition. | off |
 
 **Audio**
@@ -638,6 +642,7 @@ Other lines `play` prints:
 | `--dv-pin <spec>` | DEBUG: pulses a pinned frame's DV metadata. | off |
 | `--upscale` | `LoadOptions.upscalesLowResolutionVideo` (#846). | off |
 | `--line-art` | `LoadOptions.upscaleScaler = .lineArt` (AE#1039); implies `--upscale`. | off |
+| `--upscale-fullhd` | `LoadOptions.upscalesFullHDVideo`: Lanczos-3 for SDR 1080p sources. | off |
 | `--tone-map <nits>` | `LoadOptions.videoProcessing` with this `targetPeakNits` (#957). | off |
 | `--deinterlace-field-rate field\|frame` | `LoadOptions.deinterlaceFieldRate` (AE#492). | `field` |
 | `--inverse-telecine auto\|off\|force` | `LoadOptions.inverseTelecine` (#853). | `auto` |
@@ -651,7 +656,9 @@ Other lines `play` prints:
 | `--sequential-origin` | `LoadOptions.sequentialOrigin` (#346, AE#958). | off |
 | `--declared-duration S` | `LoadOptions.declaredDurationSeconds`. Needed with `--sequential-origin` on VOD. | none |
 | `--held-connection` | `LoadOptions.heldSourceConnection` (#377). | off |
-| `--progressive-segments` | `LoadOptions.progressiveSegmentDelivery`. | off |
+| `--no-progressive-segments` | Sets `LoadOptions.progressiveSegmentDelivery` to false. `--progressive-segments` is still accepted, changes nothing and prints a note saying so. | on |
+| `--forward-buffer-segments N` | `LoadOptions.forwardBufferSegments`. `2700` is the opt-in whole-source prefetch. | engine default |
+| `--session-cache-mb N` | `LoadOptions.sessionCacheByteBudget`, in MiB. | engine default |
 | `--max-concurrent-requests N` | `LoadOptions.maxConcurrentSourceRequests` (#377). See [Shared flags](#shared-flags). | engine default |
 
 **Corrections and reloads**
@@ -791,6 +798,16 @@ Fetch the init segment only. A second client asking for the playlist or for segm
 
 `--seek-every N` seeks once every N ticks past tick 10. It walks `--seek-pattern <abs,abs,...>` if given, otherwise it makes a short backward hop. `--seek-count K` stops after K seeks, so a run can be a BURST and then play.
 
+`--seek-after N` moves the first seek earlier (or later) than tick 10. Tick 10 is late enough that the producer has always measured its march rate by then, so a seek in the first seconds of playback, which decides on no measurement, needs an earlier tick. This is the AE#1128 shape, with the playing check one tick after `readyToPlay` so AVPlayer is not still holding a deferred seek:
+
+```bash
+python3 Scripts/slowrange.py dts30.mkv 8829 48000 0.3 &   # 30 Mbit/s source, 48 Mbit/s link
+aetherctl play --seconds 25 --seek-after 4 --seek-every 1 --seek-count 1 --seek-pattern 30 \
+  http://127.0.0.1:8829/dts30.mkv
+```
+
+The log shows `march-rate wait reason=no-measurement` for the seek, then `march-rate restart (...) branch=c-revisit` once the march has two completions.
+
 You need both halves to study what a seek sequence leaves behind. The burst puts the store in the state under test, and only the playing half shows what the overlay carries through it. This pairing reproduces AE#362's second mechanism: a hole between a restarted pump and the island the previous run left ahead of it, decoded across and then never re-read.
 
 ### Overlapping seeks (`--host-calls overlapseek`)
@@ -884,6 +901,22 @@ aetherctl play --sw --subs pgssub --subtitle-offset-reach 0 --seconds 40 \
 
 Healthy reading: `ONSCREEN` names the landing set within 0.0 to 0.4 s of each landing, the same as the default reach. The defect reading (before AE#1022): no landing line, and the set from before the seek drawn over two landings.
 
+### Bitmap cues as text (`--bitmap-text`)
+
+`--bitmap-text` sets `LoadOptions.recognizesBitmapSubtitleText` (AE#1114). A bitmap cue first logs as `CUE #N ... [bitmap]`; once Vision has read it, the republish adds a line with the text, each line's confidence, the model and the language pin:
+
+```
+  TEXT #22 'Subtitle line 25' 1.00 level=accurate language=en at=12.40
+```
+
+Fixture: `gen_fullframe_pgs.py out.sup --text` writes readable PGS sets (the default stripes read as nothing), muxed with `-c copy` and tagged `language=eng`.
+
+```bash
+aetherctl play --subs pgssub --bitmap-text --seconds 40 file://$PWD/pgs-text.mkv
+```
+
+Healthy reading, measured with a warm Vision cache: `[SubtitleOCR] overlay text: first cue read in 0.12s`, the other 20 cues of the 60 s window read within 0.4 s, and each later cue read about 0.1 s after its `CUE` line. The first run after a fresh build waits for Vision's model (54 s here). The loop then reads the cues still due first and the ones it missed after them, as far back as `maximumSubtitleDelaySeconds` (60 s by default).
+
 ### ASS markup (`--preserve-ass-markup`)
 
 `--preserve-ass-markup` sets `LoadOptions.preserveASSMarkup` for the load, so the cue log shows which codecs the flag reaches. An ASS track prints the raw nine-field event line (`0,0,Default,,0,0,0,,{\i1}line{\i0}`); every other text codec prints extracted text, in the same session.
@@ -899,7 +932,7 @@ aetherctl play --preserve-ass-markup --subs ger --seconds 7 file://$PWD/ass-srt.
 
 ### Audio shaping (`--audio-shaping`)
 
-`--audio-shaping <spec>` sets `LoadOptions.audioShaping` for the load. `--switch-audio-shaping <spec>[@ms]` calls `setAudioShaping(_:)` mid-session (repeatable, default +20 s). A spec is `off`, or a comma list of `ch=N`, `dialogue=DB`, `night`, `gain=DB` (a plain gain: a 1:1 compressor with that makeup) `loudness=LUFS` (the loudness target, AE#1036) and `lfe=DB` (the LFE level in a fold that drops it, AE#1044).
+`--audio-shaping <spec>` sets `LoadOptions.audioShaping` for the load. `--switch-audio-shaping <spec>[@ms]` calls `setAudioShaping(_:)` mid-session (repeatable, default +20 s). A spec is `off`, or a comma list of `ch=N`, `dialogue=DB`, `night`, `gain=DB` (a plain gain: a 1:1 compressor with that makeup) `loudness=LUFS` (the loudness target, AE#1036), `lfe=DB` (the LFE level in a fold that drops it, AE#1044) and `binaural` (render surround and Atmos heights to binaural stereo for headphones).
 
 The run prints `shaping=` next to the audio delivery, and the log names the pipeline each rebuild chose (AE#923). On an E-AC-3 5.1 source:
 
@@ -1004,6 +1037,8 @@ See [dolby-vision-fel.md](dolby-vision-fel.md).
 
 `--line-art` runs the line-art scaler instead (`LoadOptions.upscaleScaler = .lineArt`, AE#1039) and implies `--upscale`. It also takes 1080p and 10-bit SDR. The `UPSCALE` line then ends in `scaler=lineArt`, and the `[Upscale] timing` lines show the chain's GPU time under `metal`.
 
+`--upscale-fullhd` opts in to Lanczos-3 for SDR 1080p sources (`LoadOptions.upscalesFullHDVideo`). It combines with `--upscale`; the source's size picks the scaler. The `UPSCALE` line then ends in `scaler=lanczos`.
+
 ### Tone map (`--tone-map`)
 
 `--tone-map <nits>` opts in to the picture processing with that target peak (`LoadOptions.videoProcessing`, #957). It logs one `[VideoProcessing]` line, and a `PROCESSING toneMap <source> nit (<mastering|maxCLL>) -> <target> nit` line once the first frame is processed, again with `disabled: <reason>` if it switches itself off. The stage needs macOS 26; before that the line says `not taken (needs OS 26)`.
@@ -1033,6 +1068,8 @@ Nothing binds a render surface in a CLI run, so the absolute drop level belongs 
 ```
 
 That is the GPU cadence (#1108). When it cannot run (see [formats › Inverse telecine](formats.md#inverse-telecine)), `fieldmatch` and `decimate` sit before `format=nv12,hwupload` on the CPU instead, and a build failure logs a line saying so.
+
+Every 240 source frames a `[Deinterlace] timing` line follows (AE#1112). Under inverse telecine it reads `240 frames in, 192 out` and an output interval of 41.7 ms; the fields are explained in [architecture-software › Deinterlace timing log](architecture-software.md#deinterlace-timing-log-ae1112).
 
 With `--frame-times` the output reads `ft=24` a second and the `[SWDiag]` lines `dpts=41.7/41.7`; the deinterlacer alone reads `ft=60` at field rate. The sample's cost to the first frame over a throttled origin is in [measurements › Inverse telecine](measurements.md#inverse-telecine-853).
 
@@ -1069,6 +1106,8 @@ With `--frame-times` the output reads `ft=24` a second and the `[SWDiag]` lines 
 
 **`--skip-attachments`** sets `LoadOptions.skipsContainerAttachments` (AE#956). A Matroska source then opens without reading its attached files (the fonts of its ASS subtitles). The observable is the open itself. Against a throttled origin and an MKV that carries fonts, the time to the first `[AetherEngine]` load line drops by the fonts' transfer time, and the `[AVIOReader]` byte counts drop by their size.
 
+**`--attachments-at-open`** sets `LoadOptions.readsContainerAttachmentsAtOpen` (AE#1129), the read of the Matroska attachments at open that the default moved behind the first frame. `play` prints `FONTS count=<n> bytes=<b> t+<s>` when `fontAttachments` fills, on the same load clock as `FIRSTFRAME`, so one run each way shows both sides of the trade: the first frame moves earlier by the fonts' transfer time, and the fonts land later by about the same amount.
+
 **`--held-connection`** declares `LoadOptions.heldSourceConnection` (#377). The reader asks the origin once and pulls the whole file over that connection, instead of ending at the window high water and asking again every drain cycle.
 
 - The observable is the range count, in the origin's own log or in the `[AVIOReader] pump conn start ... held` lines. Against an origin that refuses in windows, the point is that there is no second ask to refuse.
@@ -1079,7 +1118,18 @@ With `--frame-times` the output reads `ft=24` a second and the `[SWDiag]` lines 
 - The engine's own repositions onto segment 0 right after the open still cost one connection each.
 - Slow-origin case: serve 11 MB HEVC-in-TS segments from a keep-alive origin at 200 KB/s shared across its connections. Each segment then takes about 58 s, longer than the 45 s cap a whole exchange had before #732.
 
-**`--progressive-segments`** sets `LoadOptions.progressiveSegmentDelivery`: each VOD segment is served while it is written. Run it against a throttled origin and compare the `FIRSTFRAME` and first `PHASE playing` times with and without the flag. The session log shows `serving while it is written` for every segment that went out that way. On a local or fast source the segments are cut before AVPlayer asks, and the two runs look the same.
+**`--no-progressive-segments`** turns off `LoadOptions.progressiveSegmentDelivery`, which is on by default since AE#1129. Each VOD segment is then served only once it is cut. Run both arms against a throttled origin and compare the `FIRSTFRAME` and first `PHASE playing` times. The session log shows `serving while it is written` for every segment that went out progressively. On a local or fast source the segments are cut before AVPlayer asks, and the two runs look the same.
+
+Measured for AE#1129 on a Mac: HEVC Main 10 1440x1080 with FLAC at 8 Mbit/s, first keyframes at 0 and 10.677 s, behind a 25 Mbit/s origin with 150 ms per request. Off, the first frame came at 5.8 s and playback at 5.8 s. On, they came at 1.9 s and 2.8 s. Three runs per arm, all within 0.2 s.
+
+**`--forward-buffer-segments 2700 --session-cache-mb N`** turns on the whole-source prefetch, which is what leaves a resident band behind a resume. Rewinding before the resume point is the AE#1109 repro: serve the file over HTTP, then
+
+```bash
+aetherctl play --seconds 70 --start-position 300 --forward-buffer-segments 2700 --session-cache-mb 8192 \
+  --seek-every 30 --seek-count 1 --seek-pattern 0 http://127.0.0.1:8899/film.mkv
+```
+
+The file has to be much larger than the reader's 32 MB range window, or the window pulls the tail behind the park anyway and both arms read the same (a 48 MB fixture did). Read `origin=` on the tick lines after the seek. It has to stop climbing once the stretch below the resume point is in, and the log has to show `AE#1109 seg-N...seg-M are resident`. Add `--picture-probe` on the timecode fixtures to check the seam where the new run meets the kept one.
 
 **`--max-concurrent-requests N`** sets `LoadOptions.maxConcurrentSourceRequests` (#377): the most requests the reader may have open against the origin at once, across every path it fetches on. `1` also switches off the speculative parallel paths, which is the shape of a connection-metered CDN. Count the requests in the origin's own log, or read the `[AVIOReader]` connection lines, with and without the flag.
 
@@ -1527,6 +1577,8 @@ The reader:
 | `--reload-decode-path automatic\|software` | Makes the rebuild's correction the decode path. | none |
 | `--reader-axis absolute\|join\|mismatched` | Which byte axis the reader speaks (AE#460 round 3). | `absolute` |
 | `--join-offset-mb N` | Where the join sits, for `join` and `mismatched`. | 4 |
+| `--vod-sequential SECONDS` | Loads the spool as a closed recording instead of live (AE#1117). See below. | off (live) |
+| `--seek-during-load S` | Seeks to S while the engine reads `.loading`, so it stashes the seek and replays it (AE#1117). Prints a skip line if the load never got there. | off |
 
 **The measurement.** Every ten seconds it prints `physFP` and its slope. It closes with that slope stated against the source's own mux rate:
 
@@ -1537,7 +1589,7 @@ VERDICT: physFP 105 -> 402 MB over 240s = 1.24 MB/s (source mux rate 0.95 MB/s, 
 - A ratio near 1 means the session keeps one byte for every byte it plays. On a source that never ends, that grows without bound.
 - A ratio near 0 means the footprint is the session's, not the stream's.
 
-Results from this harness are in [Measurements › customio --live](measurements.md#customio---live-spool-ae445-ae460-ae461).
+Results from this harness are in [Measurements › customio --live](measurements.md#customio---live-spool-ae445-ae460-ae461-ae1117).
 
 **Which reader arm runs decides what the ratio is about.**
 
@@ -1545,6 +1597,15 @@ Results from this harness are in [Measurements › customio --live](measurements
 - `--foundation-reader` uses `FileHandle.readData`, which strands one autoreleased `Data` per read on any thread that never drains a pool. Whatever it retains is the HOST's.
 
 Run both. The Foundation arm is the control that proves the pool drains; the POSIX arm measures the engine. An arm that allocates brings a cause of its own, so only an arm that allocates nothing can tell an engine defect from the harness's own retention.
+
+**`--vod-sequential SECONDS` (AE#1117).** This is the shape of a host that reads a finished HLS recording itself and hands the bytes over as one MPEG-TS stream. The load goes out with `isLive = false`, `sequentialOrigin = true` and the value as `declaredDurationSeconds`. Use it with `--no-wrap`, since a looped file would restart the timeline, and pace it above the file's bitrate (`--rate-kbps` about twice the mux rate). The producer then runs ahead to its forward window and parks, the way a host that fetches a few segments ahead keeps it. Because the pacer is not what the engine consumed, the verdict's ratio is taken against the bytes actually read (`read ... MB/s`), not against `--rate-kbps`.
+
+```
+aetherctl customio --live --no-wrap --rate-kbps 15000 --seconds 960 --vod-sequential 1080 fixture.ts
+VERDICT: physFP 72 -> 64 MB over 903s = -0.01 MB/s (source mux rate 1.79 MB/s, read 0.88 MB/s, retention ratio -0.01)
+```
+
+**`--seek-during-load S` (AE#1117).** Some hosts seek right after they call `load()`, at every start and every resume. The engine stashes that seek and replays it once the session settles (#178). On a sequential origin the replay is either rejected as `.sourceNotSeekable` or lands from the segment cache, depending on what the cache holds by then. The `[AetherEngine] seek` lines say which.
 
 **Read the retention ratio over a long run, not a short one.** The slope anchors at 60 s to skip the load step. That is exactly where `--reload-at 60` puts a SECOND step: the software pipeline's own baseline. A 100 s run reads ratio 1.31, which means nothing. A 260 s run shows `physFP` stepping 25 to 66 MB across the switch and then flat at 67 for 140 s: ratio 0.18 and still falling, which is a step being amortized, not a session retaining anything.
 
@@ -1616,7 +1677,7 @@ VERDICT: correction refused, session untouched and still playing
 
 `--host-carry removeFirst|subdata` is the third arm. It names a cause instead of measuring the engine.
 
-A `Data` parse carry consumed from the front with `removeFirst` only advances the slice's lower bound, so its backing store keeps every byte below it. A footprint that grows on an exact x1.25 ladder (Foundation's growth factor, not FFmpeg's) points at that carry. The AE#445 round 3 measurement is in [Measurements › customio --live](measurements.md#customio---live-spool-ae445-ae460-ae461).
+A `Data` parse carry consumed from the front with `removeFirst` only advances the slice's lower bound, so its backing store keeps every byte below it. A footprint that grows on an exact x1.25 ladder (Foundation's growth factor, not FFmpeg's) points at that carry. The AE#445 round 3 measurement is in [Measurements › customio --live](measurements.md#customio---live-spool-ae445-ae460-ae461-ae1117).
 
 - `--host-carry removeFirst` puts exactly that carry on the harness's delivery path, so the tool that measures the engine at ratio 0.00 can also produce ratio 1.00 on demand.
 - `--host-carry subdata` is the same carry re-based, which is the fix.
@@ -2246,6 +2307,7 @@ swift run -c release aetherctl bench --baseline /tmp/base.json
 | `upscale: 720p to 2160p, MetalFX only, wall time` | MetalFX alone on the 720p frame, the rung the stage drops to without an ML pass. |
 | `upscale: 1080p to 2160p, line art, wall time` | `upscaleScaler = .lineArt` on a 1920x1080 frame, upscale network only (its lower rung). |
 | `upscale: 1080p to 2160p, line art with restore, wall time` | The same with the restore pass and the highlight clamp, the stage's top rung. |
+| `upscale: 1080p to 2160p, Lanczos, wall time` | `upscalesFullHDVideo` (`.lanczos`) on a 1920x1080 frame. |
 
 The upscale cases build the stage playback builds for that plan, with its VT session and MetalFX scaler, and wait for each frame's ML pass. Their note names the plan's steps (for example `1280x720 -> ML 2x 2560x1440 -> MetalFX 3840x2160`) and the median ML and GPU time. A case is skipped with the reason when the device cannot build it: MetalFX needs tvOS 27.1, and every upscale case needs OS 26 and real hardware. The display size is fixed, so `--iterations` is the only flag that changes them.
 

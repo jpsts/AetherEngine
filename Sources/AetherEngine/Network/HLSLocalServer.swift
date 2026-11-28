@@ -54,6 +54,11 @@ protocol HLSSegmentProvider: AnyObject {
 
     var playlistType: HLSPlaylistType { get }
 
+    /// Every segment opens on a random-access point at the boundary its EXTINF names, so a VOD media
+    /// playlist may declare `EXT-X-INDEPENDENT-SEGMENTS` (AE#1128). Only a keyframe-aligned plan
+    /// promises that: a uniform stride (no usable index) opens a segment up to a GOP after its boundary.
+    var segmentsStartOnRandomAccess: Bool { get }
+
     /// Live cut-target seconds; playlist builder uses it as a TARGETDURATION floor so the first manifest (before seg0) doesn't yield TD=1 and -12888 on high-bitrate sources. Nil for VOD/EVENT.
     var liveTargetSegmentDuration: Double? { get }
 
@@ -75,6 +80,11 @@ protocol HLSSegmentProvider: AnyObject {
     /// injected SUBTITLES renditions: its variants live at the origin, so there is nothing here to
     /// describe them with. Nil on every producer-backed provider, which builds its master as before.
     var staticMasterPlaylistBody: String? { get }
+
+    /// AE#1122: the origin variant playlist the remote-HLS proxy already fetched, served VERBATIM at
+    /// `/origin_variant.m3u8`. Its URIs are absolute, so the media still comes from the origin. May block
+    /// the connection thread on a resume (`RemoteHLSResumeWarm.Gate`); `userAgent` is the requester's.
+    func servedVariantPlaylist(userAgent: String?) -> String?
 
     /// Master-playlist metadata. When masterCodecs is non-nil the server publishes master.m3u8; nil means media-playlist-only.
     var masterCodecs: String? { get }
@@ -185,6 +195,7 @@ protocol HLSSegmentProvider: AnyObject {
 }
 
 extension HLSSegmentProvider {
+    var segmentsStartOnRandomAccess: Bool { false }
     var livePlaylistGeneration: Int { 0 }
     func livePlaylistEndIndex(generation: Int) -> Int? { nil }
     func liveTargetDurationSeconds(maxSegmentDuration: Double, generation: Int) -> Int {
@@ -200,6 +211,7 @@ extension HLSSegmentProvider {
     func didServeMediaSegment(index: Int, delivered: Bool) {}
     func didDeliverProgressiveChunk(index: Int) {}
     var staticMasterPlaylistBody: String? { nil }
+    func servedVariantPlaylist(userAgent: String?) -> String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
     func initVersionID(forSegment index: Int) -> Int { 0 }
@@ -1161,6 +1173,15 @@ final class HLSLocalServer: @unchecked Sendable {
                                contentType: "application/vnd.apple.mpegurl")
             }
             return send404(fd: fd, path: normalizedPath, reason: "no masterCodecs")
+
+        case "/\(RemoteHLSMasterRewrite.servedVariantURI)":
+            let userAgent = Self.requestHeader(
+                named: "user-agent", in: Array(text.components(separatedBy: "\r\n").dropFirst()))
+            guard let body = provider?.servedVariantPlaylist(userAgent: userAgent) else {
+                return send404(fd: fd, path: normalizedPath, reason: "no served origin variant")
+            }
+            return send200(fd: fd, path: normalizedPath, data: Data(body.utf8),
+                           contentType: "application/vnd.apple.mpegurl")
 
         case "/master_hdr.m3u8":
             // #98: HDR-preserving reduced master (DV signaling dropped, source range + subtitle
@@ -2234,6 +2255,11 @@ final class HLSLocalServer: @unchecked Sendable {
         } else {
             // EXT-X-PLAYLIST-TYPE:VOD lets AVPlayer prune fetched segments past the buffer-behind window; without it RSS grows linearly with segment count for the whole playback.
             lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+            // AE#1128: without it a media playlist loaded directly made AVPlayer begin each exact seek
+            // 1 to 3 segments early to find a decodable start (2 segments at a 2 s GOP, 3 at 4 s).
+            if provider.segmentsStartOnRandomAccess {
+                lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
+            }
         }
         // Absolute custom-scheme URIs route sub-resources through AVAssetResourceLoader; relative URIs go through CFNetwork (aetherctl workflow).
         let initURI: (Int) -> String

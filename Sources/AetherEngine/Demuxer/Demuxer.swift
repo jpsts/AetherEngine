@@ -70,9 +70,10 @@ struct DemuxerOpenProfile: Sendable {
     /// the one shape a held connection must not take.
     var avioHeldConnection: Bool = false
 
-    /// AE#956: open a Matroska source without reading its attachments (`skip_attachments`). The
-    /// session's probe demuxer is the only open whose attachments anything reads (fonts, cover art),
-    /// so it follows `LoadOptions.skipsContainerAttachments`; side readers and reopens always skip.
+    /// AE#956: open a Matroska source without reading its attachments (`skip_attachments`). Only two
+    /// opens read them: the session's probe demuxer when the load's `AttachmentReadPlan` says
+    /// `.atOpen`, and the attachment side reader that fetches them after the first frame (AE#1129).
+    /// Every other side reader and reopen skips them.
     var skipsAttachments: Bool = false
 
     /// `LoadOptions.declaredDurationSeconds`: caller-trusted duration override consumed by
@@ -239,6 +240,19 @@ struct DemuxerOpenProfile: Sendable {
         // open-ended at the seek target immediately after, so sustained reads are untouched.
         profile.boundedInitialFetch = 8 * 1024 * 1024
         profile.skipsAttachments = true
+        return profile
+    }()
+
+    /// AE#1129: the reader that fetches a Matroska source's attachments once playback is up. It
+    /// needs `avformat_open_input` only (the header and the Attachments element, found through the
+    /// SeekHead wherever it sits), so the stream analysis is skipped. Keeps the playback AVIO tuning:
+    /// the attachments are one sequential read of up to tens of megabytes.
+    static let attachmentSideReader: DemuxerOpenProfile = {
+        var profile = playback
+        profile.skipStreamInfo = true
+        profile.skipsAttachments = false
+        profile.auditsRecordlessDolbyVision = false
+        profile.readerLabel = "attachments"
         return profile
     }()
 
@@ -448,6 +462,10 @@ public final class Demuxer: @unchecked Sendable {
     /// Number of attached-picture (cover-art) streams reclassified to ATTACHMENT before
     /// stream-info probing on the most recent open. See `reclassifyAttachedPictures`. (#75)
     private(set) var attachedPictureStreamsReclassified: Int = 0
+
+    /// Attachment streams the most recent open kept out of stream-info probing because the demuxer
+    /// could not name their codec. See `parkUnnamedAttachments`. (AE#1129)
+    private(set) var unnamedAttachmentsParked: Int = 0
 
     // Memory probe: compare against RSS growth; 0 for file:// sources.
     var avioBytesFetched: Int64 { avioProvider?.cumulativeBytesFetched ?? 0 }
@@ -1344,6 +1362,7 @@ public final class Demuxer: @unchecked Sendable {
 
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
         unresolvableAudioStreams = []
+        unnamedAttachmentsParked = 0
         // #87: the subtitle side demuxer opts out of find_stream_info. avformat_open_input already
         // carries codec_id / codec_type for every subtitle track (container header / PMT), and
         // reclassifyAttachedPictures only exists to bound the find_stream_info cost, so both are skipped.
@@ -1357,6 +1376,7 @@ public final class Demuxer: @unchecked Sendable {
         let parked = parkUnresolvableAudio(ctx)
         let parkedPGS = parkPGSSubtitles(ctx)
         let parkedData = parkUnnamedDataStreams(ctx)
+        let parkedAttachments = parkUnnamedAttachments(ctx)
         let bytesBefore = ctx.pointee.pb?.pointee.bytes_read ?? 0
         let callStart = DispatchTime.now().uptimeNanoseconds
         interrupt.armHeaderWait(ctx, startedAt: callStart)
@@ -1366,9 +1386,11 @@ public final class Demuxer: @unchecked Sendable {
         unparkUnresolvableAudio(ctx, parked)
         unparkPGSSubtitles(ctx, parkedPGS)
         unparkUnnamedDataStreams(ctx, parkedData)
+        unparkUnnamedAttachments(ctx, parkedAttachments)
         probeReport = makeProbeReport(ctx, parkedAudio: parked, bytesBefore: bytesBefore,
                                       callStart: callStart, callReturn: callReturn,
-                                      headerWaitReleasedAfter: headerWaitReleasedAfter)
+                                      headerWaitReleasedAfter: headerWaitReleasedAfter,
+                                      attachmentsParked: parkedAttachments.count)
         guard findRet >= 0 else {
             emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
             throw DemuxerError.streamInfoFailed(code: findRet)
@@ -1390,15 +1412,16 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
-    /// What the stream analysis of the current open did, for the `open timings` line. Nil until the
+    /// What the stream analysis of the current open did, for the `open timings` line and for the still
+    /// decoder, which tells a source without video from a cut analysis by it (AE#1118). Nil until the
     /// pass ran (an open that failed earlier, a side reader that skips it).
-    private var probeReport: ProbeReport?
+    private(set) var probeReport: ProbeReport?
 
     /// Reads the format context once `avformat_find_stream_info` has returned. Public fields only, so
     /// the line says how the pass ended without reaching inside it.
     private func makeProbeReport(_ ctx: UnsafeMutablePointer<AVFormatContext>, parkedAudio: [Int],
                                  bytesBefore: Int64, callStart: UInt64, callReturn: UInt64,
-                                 headerWaitReleasedAfter: UInt64?) -> ProbeReport {
+                                 headerWaitReleasedAfter: UInt64?, attachmentsParked: Int) -> ProbeReport {
         let isMPEGTS = ctx.pointee.iformat.map { String(cString: $0.pointee.name) == "mpegts" } ?? false
         var programs = 0
         var pmtMissing = 0
@@ -1438,7 +1461,7 @@ public final class Demuxer: @unchecked Sendable {
         let closeToReturn = closedAt.map { callReturn - max($0, callStart) }
         return ProbeReport(stop: stop, unresolved: unresolved, programs: programs, pmtMissing: pmtMissing,
                            headerWaitReleasedAfter: headerWaitReleasedAfter, probeBytes: bytes,
-                           closeToReturn: closeToReturn)
+                           closeToReturn: closeToReturn, attachmentsParked: attachmentsParked)
     }
 
     /// An audio stream this build can never resolve, named so a report can say why a source came up
@@ -1600,6 +1623,46 @@ public final class Demuxer: @unchecked Sendable {
                                           _ parked: [(Int, AVDiscard)]) {
         for (i, discard) in parked where i < Int(ctx.pointee.nb_streams) {
             ctx.pointee.streams[i]?.pointee.discard = discard
+        }
+    }
+
+    /// Whether this is an attached file whose type the demuxer could not name. (AE#1129)
+    ///
+    /// `matroskadec` names an attachment only from a short MIME list (`application/x-truetype-font`,
+    /// `application/x-font`, `application/vnd.ms-opentype`, `binary`). MKVToolNix writes the RFC 8081
+    /// types (`font/ttf`, `font/otf`, `font/sfnt`) by default, on Windows since v58, and since v99 it
+    /// rewrites the old names to them on every remux. So the fonts of nearly every current anime release
+    /// arrive as `AV_CODEC_ID_NONE`, and `has_codec_parameters` fails those with "unknown codec". An
+    /// attachment never carries a packet, so nothing resolves it, and the probe reads on until
+    /// `max_analyze_duration`: 60 s of content. On a test file shaped like the report (about 5 Mbit/s
+    /// of video and audio) that was 36.7 MB, 4.5 s over a 68 Mbit/s link. An attachment that does
+    /// carry a codec id is resolved.
+    static func attachmentNeedsNoProbe(codecID: AVCodecID, codecType: AVMediaType) -> Bool {
+        codecType == AVMEDIA_TYPE_ATTACHMENT && codecID == AV_CODEC_ID_NONE
+    }
+
+    /// Give unnamed attachments `AV_CODEC_ID_BIN_DATA` for the duration of the probe, which
+    /// `has_codec_parameters` accepts for an attachment, so the pass stops once the real tracks are
+    /// known. The restore follows the probe because `find_stream_info` writes its context back over
+    /// `codecpar`; the payload in `extradata` is never touched, and `fontAttachmentInfos` goes by
+    /// MIME type and file name, not by codec. (AE#1129)
+    private func parkUnnamedAttachments(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [Int] {
+        var parked: [Int] = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let codecpar = ctx.pointee.streams[i]?.pointee.codecpar,
+                  Self.attachmentNeedsNoProbe(codecID: codecpar.pointee.codec_id,
+                                              codecType: codecpar.pointee.codec_type)
+            else { continue }
+            codecpar.pointee.codec_id = AV_CODEC_ID_BIN_DATA
+            parked.append(i)
+        }
+        unnamedAttachmentsParked = parked.count
+        return parked
+    }
+
+    private func unparkUnnamedAttachments(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int]) {
+        for i in parked where i < Int(ctx.pointee.nb_streams) {
+            ctx.pointee.streams[i]?.pointee.codecpar?.pointee.codec_id = AV_CODEC_ID_NONE
         }
     }
 
@@ -2029,7 +2092,9 @@ public final class Demuxer: @unchecked Sendable {
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return }
         reclassifyAttachedPictures(ctx)
+        let parkedAttachments = parkUnnamedAttachments(ctx)
         _ = avformat_find_stream_info(ctx, nil)
+        unparkUnnamedAttachments(ctx, parkedAttachments)
         refreshStreamTableLocked(rebuildTracks: true)
     }
 
@@ -2466,6 +2531,31 @@ public final class Demuxer: @unchecked Sendable {
         return nil
     }
 
+    /// AE#1127: the track list is rebuilt on many reads and the extradata never changes under a
+    /// stream, so each header is split once.
+    private let assHeaderSplitLock = NSLock()
+    private var assHeaderSplits: [Int: (extradata: Data, header: String?, events: [ASSHeaderEvent])] = [:]
+
+    private func splitASSHeader(_ extradata: Data, streamIndex: Int) -> (String?, [ASSHeaderEvent]) {
+        assHeaderSplitLock.lock()
+        if let cached = assHeaderSplits[streamIndex], cached.extradata == extradata {
+            assHeaderSplitLock.unlock()
+            return (cached.header, cached.events)
+        }
+        assHeaderSplitLock.unlock()
+        // MKV CodecPrivate is frequently NUL-terminated; strip NULs so libass
+        // (C-string-style parser) doesn't silently stop before host-appended content.
+        var header: String? = nil
+        var events: [ASSHeaderEvent] = []
+        if let text = String(data: extradata, encoding: .utf8)?.replacingOccurrences(of: "\0", with: "") {
+            (header, events) = ASSHeaderEvents.split(text)
+        }
+        assHeaderSplitLock.lock()
+        assHeaderSplits[streamIndex] = (extradata, header, events)
+        assHeaderSplitLock.unlock()
+        return (header, events)
+    }
+
     private func trackInfo(from stream: UnsafeMutablePointer<AVStream>, index: Int) -> TrackInfo {
         let codecpar = stream.pointee.codecpar!
         let codecName: String
@@ -2510,16 +2600,14 @@ public final class Demuxer: @unchecked Sendable {
         // ASS/SSA codec extradata = script header ([Script Info] + [V4+ Styles] +
         // [Events] format line). Surfaced for LoadOptions.preserveASSMarkup hosts.
         var assHeader: String? = nil
+        var headerEvents: [ASSHeaderEvent] = []
         let codecID = codecpar.pointee.codec_id
         let isAudio = codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO
         if codecID == AV_CODEC_ID_ASS || codecID == AV_CODEC_ID_SSA,
            let extradata = codecpar.pointee.extradata,
            codecpar.pointee.extradata_size > 0 {
             let bytes = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
-            // MKV CodecPrivate is frequently NUL-terminated; strip NULs so libass
-            // (C-string-style parser) doesn't silently stop before host-appended content.
-            assHeader = String(data: bytes, encoding: .utf8)?
-                .replacingOccurrences(of: "\0", with: "")
+            (assHeader, headerEvents) = splitASSHeader(bytes, streamIndex: index)
         }
 
         var info = TrackInfo(
@@ -2543,6 +2631,7 @@ public final class Demuxer: @unchecked Sendable {
             profile: VideoStreamFormat.profileName(codecID: codecID, profile: codecpar.pointee.profile)
         )
         if let title, !title.isEmpty { info.sourceTitle = title }
+        info.headerEvents = headerEvents
         return info
     }
 
@@ -4243,12 +4332,15 @@ struct ProbeReport: Equatable, Sendable {
     let probeBytes: Int64
     /// From the close request to the call's return, nil without a close.
     let closeToReturn: UInt64?
+    /// Attachments without a codec id kept out of the pass (`parkUnnamedAttachments`, AE#1129).
+    var attachmentsParked = 0
 
     var logFields: String {
         func ms(_ ns: UInt64) -> String { "\(ns / 1_000_000)ms" }
         return "probe stop=\(stop.rawValue), unresolved=\(unresolved), programs=\(programs), "
             + "pmtMissing=\(pmtMissing), headerWait=\(headerWaitReleasedAfter.map { "released@\(ms($0))" } ?? "-"), "
-            + "probeBytes=\(probeBytes), closeToReturn=\(closeToReturn.map(ms) ?? "-")"
+            + "probeBytes=\(probeBytes), closeToReturn=\(closeToReturn.map(ms) ?? "-"), "
+            + "attachmentsParked=\(attachmentsParked)"
     }
 
     /// The first cause that applies, in the order a pass can end: a close or an interrupt ends it

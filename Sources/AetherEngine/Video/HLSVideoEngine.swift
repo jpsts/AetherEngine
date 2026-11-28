@@ -517,6 +517,40 @@ public final class HLSVideoEngine: @unchecked Sendable {
         armSubtitleTap(on: prod)
     }
 
+    /// AE#1127: the pump never sees the events a muxer left in a track's header, so the rendition
+    /// gets them here, once per store. Own decoders and no tap lock: the pump keeps tapping while
+    /// a long script decodes.
+    private func fillNativeStoresWithHeaderEvents() {
+        guard let dem = demuxer else { return }
+        let tracks = dem.subtitleTrackInfos().filter { !$0.headerEvents.isEmpty }
+        guard !tracks.isEmpty else { return }
+        // Read under the tap lock like the route rebuild, never restartLock: a producer build calls
+        // this and may hold it.
+        subtitleTapLock.lock()
+        let stores = nativeSubtitleCueStoresForSession
+        let sourceStreamIndices = nativeSubtitleSourceStreamIndicesForSession
+        subtitleTapLock.unlock()
+        for (store, sidx) in zip(stores, sourceStreamIndices) {
+            guard let sidx, let track = tracks.first(where: { Int32($0.id) == sidx }),
+                  store.claimHeaderEventFill(),
+                  let made = dem.withStream(at: sidx, { stream in
+                      // Same shape as the tap route's decoder, so both write the same cue to the store.
+                      EmbeddedSubtitleDecoder(stream: stream, sourceVideoWidth: 1920, sourceVideoHeight: 1080,
+                                              preserveASSMarkup: preserveASSMarkupForSubtitleTap)
+                  }), let decoder = made else { continue }
+            var cues: [SubtitleCue] = []
+            for event in track.headerEvents {
+                let packet = StoredSubtitlePacket(ptsSeconds: event.startSeconds,
+                                                  durationSeconds: event.durationSeconds,
+                                                  flags: 0, payload: event.payload)
+                if let decoded = AetherEngine.decodeStoredSubtitlePacket(packet, with: decoder) {
+                    cues.append(contentsOf: decoded.cues)
+                }
+            }
+            store.appendCues(cues)
+        }
+    }
+
     /// Attach one store per non-bitmap subtitle track from the engine's demuxer (#55, all-tracks).
     /// Call after `start()`. Returns per-track languages for logging.
     @discardableResult
@@ -536,6 +570,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// EmbeddedSubtitleDecoder per demuxable text track, plain text (the native rendition carries no
     /// markup). Decoders live for the session, not the producer, so a restart's re-read dedups.
     private func rebuildSubtitleTapRoutes() {
+        rebuildSubtitleTapRoutesLocked()
+        fillNativeStoresWithHeaderEvents()
+    }
+
+    private func rebuildSubtitleTapRoutesLocked() {
         subtitleTapLock.lock()
         defer { subtitleTapLock.unlock() }
         subtitleTapRoutes.removeAll()
@@ -901,7 +940,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
             guard first else { return }
         }
         provider?.abortSequentialStartupWait()
+        restartLock.lock()
+        if vodSourceFailure == nil { vodSourceFailure = VODSourceFailure(code: code, reason: reason, kind: kind) }
+        restartLock.unlock()
         onVODSourceFailed?(code, reason, kind)
+    }
+
+    /// A terminal source failure, as `surfaceVODSourceFailure` reported it.
+    struct VODSourceFailure: Error, LocalizedError {
+        let code: Int32
+        let reason: String
+        let kind: PlaybackErrorKind
+        var errorDescription: String? { "\(reason) (code \(code))" }
+        /// What the host sees, whether the failure arrives through `onVODSourceFailed` or a thrown load.
+        var errorInfo: PlaybackErrorInfo {
+            PlaybackErrorInfo(kind: kind, message: "\(reason) (code \(code))", underlyingCode: Int(code))
+        }
+    }
+    private var vodSourceFailure: VODSourceFailure?
+
+    /// The first terminal failure this session surfaced. Retained because the first pumps can die
+    /// during `start()`, before loadNative installs this session, and `onVODSourceFailed` then has
+    /// nobody to tell: the load mounted a session that never wrote a segment and sat at 0:00.
+    var pendingVODSourceFailure: VODSourceFailure? {
+        restartLock.lock(); defer { restartLock.unlock() }
+        return vodSourceFailure
     }
     private let silentBridgeSurfaceLock = NSLock()
     private var silentBridgeFailureSurfaced = false
@@ -947,7 +1010,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// `LoadOptions.progressiveSegmentDelivery`, handed to the provider and to every producer this
     /// session builds. Set before `start()`.
-    var servesSegmentsProgressively = false
+    var servesSegmentsProgressively = true
 
     /// AE#1095: the host's load options when it asked for `retainsSessionCacheAfterStop`, already
     /// stripped of what only labels a load. nil leaves parking out of this session entirely. Set
@@ -2318,6 +2381,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
         adoptParkedSegmentsIfPlanMatches(plan: plan, cache: segmentCache)
+        // AE#1127: after the adoption, which replaces the store's contents wholesale.
+        subtitlePacketStore.seedHeaderEvents(from: dem.subtitleTrackInfos())
 
         // Fallback duration from avg_frame_rate for MKVs that drop TrackEntry DefaultDuration
         // (HandBrake/web-rip pipelines). Without it, trun.last.duration=0 and AVPlayer parks on
@@ -2456,6 +2521,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     + "\(FLACStreamInfo.coreMediaMinimumBlockSize), bridging instead of stream-copy",
                     category: .session
                 )
+            } else if Self.flacNeedsRelabel(audioStream.pointee.codecpar) {
+                // AE#1120: CoreMedia reads no layout from a FLAC sample entry and assumes the default.
+                bridgePreferred = true
+                EngineLog.emit(
+                    "[HLSVideoEngine] audio: FLAC layout "
+                    + "\(Demuxer.channelLayoutDescription(&audioStream.pointee.codecpar.pointee.ch_layout) ?? "?") "
+                    + "is not the default for \(acpForHE.ch_layout.nb_channels) channels and an fMP4 FLAC track "
+                    + "cannot label it; serving it as PCM instead of stream-copy",
+                    category: .session
+                )
             } else if AACAudioSpecificConfig.coreMediaRejects(UnsafePointer(audioStream.pointee.codecpar)) {
                 // AE#1047: CoreMedia refuses an esds whose layout lives in a PCE.
                 bridgePreferred = true
@@ -2480,7 +2555,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
                              }
                              ?? Self.encoderLabel(AudioBridge.bridgeEncoder(
                                 for: audioBridgeMode,
-                                sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased())
+                                sourceChannels: acpForHE.ch_layout.nb_channels,
+                                flacCarriesLayout: FLACChannelLabels.carries(
+                                    &audioStream.pointee.codecpar.pointee.ch_layout))).uppercased())
                           + " re-encode",
                     category: .session
                 )
@@ -2714,6 +2791,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             },
             // #93 residual: the first producer may be anchored at the resume segment; without this
             // the cold-start heuristic (abs(index - lastRestartIndex) > 2) restarts it immediately.
+            // AE#1128: only a keyframe-aligned plan lets the media playlist call its segments independent.
+            segmentsStartOnRandomAccess: planBoundariesClaimRandomAccess,
             initialRestartIndex: initialProducerBaseIndex,
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
@@ -5116,7 +5195,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// is nothing to act on: live, no recorded reach for the landing segment, a random-access point
     /// already within reach below the target, or a re-cut whose gate did not open in time.
     func preparedSeekLanding(itemSeconds: Double) -> Double {
-        guard !isLiveSession, let provider else { return itemSeconds }
+        guard Self.seekLandingMayRecut(isLiveSession: isLiveSession,
+                                       sequentialOrigin: sequentialOriginPinsProducerToZero),
+              let provider else { return itemSeconds }
         dropUnstartedRecut()
         let index = segmentIndexForPlaylistTime(itemSeconds)
         guard let reach = provider.videoReach(at: index) else { return itemSeconds }
@@ -5227,6 +5308,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if landingReach.serves(offsetSeconds: offsetIntoSegment) { return false }
         guard let coveringSyncDistance else { return true }
         return coveringSyncDistance > coldSeekLookbackSeconds
+    }
+
+    /// AE#1117: a re-cut is a restart. Live has its own landing rules, and a sequential origin answers
+    /// every restart by failing the session with code -5, so a landing a little late beats a dead player.
+    static func seekLandingMayRecut(isLiveSession: Bool, sequentialOrigin: Bool) -> Bool {
+        !isLiveSession && !sequentialOrigin
     }
 
     /// `segmentPlan[index].startSeconds` on the AVPlayer/playlist axis, taking `restartLock` itself.

@@ -929,6 +929,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Dynamic PTS shift = firstActualDts - desiredFirstTfdt; Int64.min = not yet computed.
     private var videoShiftPts: Int64 = Int64.min
     private var audioShiftPts: Int64 = Int64.min
+    /// AE#1109: set once this producer adopted a segment; the first one opened its epoch.
+    private var adoptedFirstSegment = false
 
     /// Max segments ahead of AVPlayer's highest fetched segment. Historically a constant (cut from 20 to
     /// 10; 4K HEVC ~10 MB/seg = 200 MB old buffer); now per session from `LoadOptions.forwardBufferSegments`
@@ -1668,7 +1670,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioMoovPrimeKnownUnobtainable: Bool = false,
         audioDelaySeconds: Double = 0,
-        servesSegmentsProgressively: Bool = false,
+        servesSegmentsProgressively: Bool = true,
         foldsDolbyVisionFEL: Bool = true,
         epoch: UInt64 = 0
     ) {
@@ -1725,8 +1727,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.baseIndex = baseIndex
         self.sourceVideoTimeBase = video.timeBase
         self.videoCodecparForTap = video.codecpar
-        self.frameGrid = isLive ? nil : video.frameGrid
-        self.pulldownRetimer = (isLive ? nil : video.frameGrid).flatMap {
+        // Each producer follows the track's drift against the grid segment by segment
+        // (`CFRFrameGrid.Phase`); the retimer places through the same copy.
+        let trackingGrid = isLive ? nil : video.frameGrid?.trackingCopy()
+        self.frameGrid = trackingGrid
+        self.pulldownRetimer = trackingGrid.flatMap {
             PulldownCadenceRetimer(grid: $0, latch: video.pulldownLatch)
         }
         self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
@@ -2594,7 +2599,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             cache.adopt(index: currentMuxerSegmentIndex,
                         stagingPath: path,
                         byteCount: bytesWritten,
-                        videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex))
+                        videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex),
+                        lineage: takeLineage())
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
@@ -2689,6 +2695,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // backlog exceeded bufferAheadSegments.
             if !awaitLiveWindowHeadroom(head: newIdx) { return nil }
         } else {
+            // AE#1109: a restart below a band the cache already holds stops at the band. Without
+            // this the forward park never holds a whole-source prefetch (its target sits thousands
+            // of segments below the head), so the pump cut the rest of the title again.
+            if onSequentialSegmentFinalized == nil, !awaitResidentRunHandover(head: newIdx) { return nil }
             let backpressureTarget = newIdx - bufferAheadSegments
             let parkSkipped = onSequentialSegmentFinalized != nil
                 && Self.sequentialParkWouldSelfDeadlock(target: backpressureTarget,
@@ -2720,6 +2730,102 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if checkShouldStop() { return nil }
 
         return muxer
+    }
+
+    /// AE#1109: the axis this producer writes on, once its gate has opened.
+    private var writtenAxis: SegmentLineage.Axis? {
+        guard videoShiftPts != Int64.min else { return nil }
+        return SegmentLineage.Axis(videoShiftPts: videoShiftPts, audioShiftPts: audioShiftPts,
+                                   audioDelaySeconds: audioDelaySeconds)
+    }
+
+    /// AE#1109: the lineage of the segment being adopted. The first one this producer adopts opened
+    /// its epoch.
+    private func takeLineage() -> SegmentLineage? {
+        let opensEpoch = !adoptedFirstSegment
+        adoptedFirstSegment = true
+        return writtenAxis.map { SegmentLineage(axis: $0, opensEpoch: opensEpoch) }
+    }
+
+    /// AE#1109: how far a kept run has to reach past the pump's head before the pump stops in front
+    /// of it. The consumer reaching its end asks for an index the provider restarts at, and AVPlayer
+    /// asks a few segments ahead of what it plays, so a run this deep hands that restart a full
+    /// cushion. Same depth and same measure as the provider's rule for keeping a producer on a
+    /// resident backward target (`residentBackwardTargetKeepsProducer`).
+    static let residentRunMinimumDepth = VideoSegmentProvider.forwardWaitWindow
+
+    /// AE#1109: whether a run of kept segments from `head` through `frontier` lets the pump stop in
+    /// front of it. A run that reaches the last plan index leaves nothing to produce at any depth.
+    static func residentRunHoldsPump(head: Int, frontier: Int, lastIndex: Int,
+                                     minimumDepth: Int = residentRunMinimumDepth) -> Bool {
+        guard frontier >= head else { return false }
+        return frontier >= lastIndex || frontier - head >= minimumDepth
+    }
+
+    /// AE#1109: whether a parked pump goes back to cutting, given the first gap in the minimum depth
+    /// behind its head (nil while that stretch still holds). Only for a gap the consumer has not
+    /// reached: the provider waits on the active producer for an index that close to its base instead
+    /// of restarting, so nobody else would fill it. A gap behind the consumer is an eviction behind
+    /// the playhead, and cutting there would pull the band through the pump a second time, one
+    /// segment per eviction. A gap further on is the provider's restart.
+    static func residentRunParkReleases(consumerTarget: Int, firstGap: Int?) -> Bool {
+        guard let firstGap else { return false }
+        return firstGap > consumerTarget
+    }
+
+    /// AE#1109: parks the pump while the segments from `head` on are already resident, written on
+    /// this producer's axis by an earlier producer. Returns true to go on cutting, false when the
+    /// pump was asked to stop.
+    ///
+    /// While this producer is installed nothing else writes segments, so the run only changes by
+    /// eviction: the full walk runs once, and the recheck after each wake only looks a minimum depth
+    /// ahead. A segment that ends the run without qualifying is evicted, so the consumer misses there
+    /// and the provider restarts a producer at it.
+    private func awaitResidentRunHandover(head: Int) -> Bool {
+        guard let axis = writtenAxis,
+              let run = cache.keepableResidentRun(from: head, axis: axis)
+        else { return true }
+        let lastIndex = baseIndex + max(0, segmentBoundaries.count - 2)
+        guard Self.residentRunHoldsPump(head: head, frontier: run.frontier, lastIndex: lastIndex)
+        else { return true }
+        // Refused when the consumer already asked for the breaker (it has those bytes either way) or
+        // when it is gone already.
+        let dropped = run.breaker.map { cache.dropForRecut(index: $0) } ?? false
+        let parkedSince = DispatchTime.now().uptimeNanoseconds
+        // #240: a parked pump is not using the link.
+        sideReaderLinkGate?.videoFetchEnded()
+        defer { sideReaderLinkGate?.videoFetchBegan() }
+        if pumpQoSCurrent == QOS_CLASS_UTILITY { pumpRelaxationRate.reset() }
+        EngineLog.emit(
+            "[HLSSegmentProducer] AE#1109 seg-\(head)...seg-\(run.frontier) are resident, written on "
+            + "this producer's axis by an earlier one; parking instead of cutting them again "
+            + "(last plan index \(lastIndex), cacheTarget=\(cache.targetIndex)"
+            + (run.breaker.map { ", seg-\($0) after it was written another way and "
+                + (dropped ? "is evicted" : "was not evicted (already asked for, or gone)") } ?? "")
+            + ")",
+            category: .session
+        )
+        let recheckLimit = head + Self.residentRunMinimumDepth
+        while !checkShouldStop() {
+            cache.awaitChange(timeout: 1.0)
+            let window = cache.keepableResidentRun(from: head, axis: axis, through: recheckLimit)
+            let holds = window.map {
+                Self.residentRunHoldsPump(head: head, frontier: $0.frontier, lastIndex: lastIndex)
+            } ?? false
+            let firstGap = holds ? nil : (window.map { $0.frontier + 1 } ?? head)
+            let consumerTarget = cache.targetIndex
+            if Self.residentRunParkReleases(consumerTarget: consumerTarget, firstGap: firstGap) {
+                let seconds = Double(DispatchTime.now().uptimeNanoseconds - parkedSince) / 1e9
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#1109 resident run at seg-\(head) has a gap at "
+                    + "seg-\(firstGap ?? head) after \(String(format: "%.1f", seconds))s, ahead of the "
+                    + "consumer (cacheTarget=\(consumerTarget)); cutting from the head",
+                    category: .session
+                )
+                return true
+            }
+        }
+        return false
     }
 
     /// Sequential-VOD duration became known (next segment's start recorded at the ledger).
@@ -2847,7 +2953,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
             cache.adopt(index: idx, stagingPath: result.path,
                         byteCount: result.bytesWritten,
-                        videoReach: takeVideoReach(forSegmentIndex: idx))
+                        videoReach: takeVideoReach(forSegmentIndex: idx),
+                        lineage: takeLineage())
             if isLive {
                 reportLiveSegmentFinalized(index: idx, nextIndex: nil)
             } else if onSequentialSegmentFinalized != nil {
@@ -5190,6 +5297,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // AE#886: decided on the source time base, before the rescale rounds it away.
         // Sodalite#236: the retimer owns every packet of a 24p grid, so its window sees them all.
         let onGridMuxer = muxer.muxerVideoTimeBase.den == frameGrid?.outputTimeBase.den
+        // The drift band starts afresh with every segment, so a restarted producer writes a segment
+        // exactly as the continuous one did.
+        frameGrid?.beginSegment(muxer.currentSegmentIndex)
         let gridded: (pts: Int64, dts: Int64, duration: Int64)?
         if !onGridMuxer {
             gridded = nil

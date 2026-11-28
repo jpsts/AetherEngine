@@ -134,9 +134,12 @@ func printUsage() {
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
-      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] [--reader-axis absolute|join|mismatched] [--join-offset-mb N] <file.ts>
+      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] [--reader-axis absolute|join|mismatched] [--join-offset-mb N] [--vod-sequential SECONDS] [--seek-during-load S] <file.ts>
                          (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
-                          never EOF, unknown size; prints physFP and its slope against that rate)
+                          never EOF, unknown size; prints physFP and its slope against that rate.
+                          AE#1117: --vod-sequential loads it as a closed recording with sequentialOrigin
+                          and that declared duration; pair it with --no-wrap. --seek-during-load
+                          issues a seek before the load returns, so the engine stashes and replays it)
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--standard-join] [--live-cushion N] [--startup-grace S] [--single-segment-min S] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
                      [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N] [--live-only] [--no-blocking-reload] [--force-master]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
@@ -857,6 +860,8 @@ if first == "play" {
     // AE#293: the nativeRemoteHLS bypass, the path the #168 carriage watchdog and the carriage probe
     // live on. Pair with --live; without it the m3u8 goes to the raw live path, which rejects it.
     let nativeHLS = takeFlag("--native-hls", from: &rest)
+    // AE#1123: LoadOptions.nativeRemoteHLSReadinessBudgetSeconds, the bypass's #334 ceiling on silence.
+    let readinessBudget = takeDoubleFlag("--readiness-budget", in: 0...maxRunSeconds, from: &rest)
     // AE#495: stand in for a host that has answered `EngineTLS.serverTrustEvaluator`, which is what
     // decides whether a remote https master is relayed through the loopback origin instead of being
     // handed to AVPlayer (which asks no delegate and cannot be told about a private certificate).
@@ -903,6 +908,9 @@ if first == "play" {
     // shape needs both halves: the burst leaves the store in the state under test, and only the
     // playing half shows what the overlay carries through it.
     let seekCount = takeIntFlag("--seek-count", from: &rest)
+    // AE#1128: the first seek may come before the producer has a measured march rate, which only a
+    // seek in the first seconds of playback reaches. Seeks fire past this tick (default 10).
+    let seekAfter = takeIntFlag("--seek-after", from: &rest)
     let mallocCensus = takeFlag("--malloc-census", from: &rest)
     let playForceSW = takeFlag("--sw", from: &rest)
     let playSoftwareEscalation = !takeFlag("--no-sw-escalation", from: &rest)
@@ -927,6 +935,8 @@ if first == "play" {
     // AE#1039: `LoadOptions.upscaleScaler = .lineArt`; implies --upscale.
     let playLineArt = takeFlag("--line-art", from: &rest)
     let playUpscale = takeFlag("--upscale", from: &rest) || playLineArt
+    // `LoadOptions.upscalesFullHDVideo`: Lanczos for 1080p sources, off by default as in the engine.
+    let playUpscaleFullHD = takeFlag("--upscale-fullhd", from: &rest)
     // #957: `LoadOptions.videoProcessing` with this target peak; off by default as in the engine.
     var playVideoProcessing: VideoProcessingOptions?
     if let spec = takeStringFlag("--tone-map", from: &rest) {
@@ -1042,9 +1052,17 @@ if first == "play" {
     // drain cycle. This is the knob for an origin that refuses new requests in windows: run it
     // against one and count the ranges in its own log, or read `conn start ... held` here.
     let heldConnection = takeFlag("--held-connection", from: &rest)
-    // LoadOptions.progressiveSegmentDelivery: serve each VOD segment while it is written. Pair it
-    // with a throttled origin to see the startup difference; on a fast source nothing changes.
-    let progressiveSegments = takeFlag("--progressive-segments", from: &rest)
+    // LoadOptions.progressiveSegmentDelivery, on by default since AE#1129. --no-progressive-segments
+    // is the other arm of an A/B against a throttled origin; --progressive-segments stays accepted
+    // so older recipes still parse.
+    if takeFlag("--progressive-segments", from: &rest) {
+        print("NOTE: --progressive-segments is the default now; --no-progressive-segments is the other arm")
+    }
+    let progressiveSegments = !takeFlag("--no-progressive-segments", from: &rest)
+    // AE#1109: the opt-in whole-source prefetch, which is what leaves a resident band behind a
+    // resume for a backward seek to restart under.
+    PlayCacheOverrides.forwardBufferSegments = takeIntFlag("--forward-buffer-segments", from: &rest)
+    PlayCacheOverrides.sessionCacheByteBudget = takeIntFlag("--session-cache-mb", from: &rest).map { $0 << 20 }
     // #731: TrueHD Atmos or DTS:X rendered into a bed as APAC; the 1 Hz line then reports its objects.
     let playObjectAudio = objectAudioRendering(
         takeStringFlag("--atmos-bed", from: &rest), format: takeStringFlag("--bed-format", from: &rest))
@@ -1130,11 +1148,11 @@ if first == "play" {
     }
     // AE#923: `--audio-shaping <spec>` is the load option, `--switch-audio-shaping <spec>[@ms]` the
     // runtime setter. A spec is `off` or a comma list of `ch=N`, `dialogue=DB`, `night`, `gain=DB`,
-    // `loudness=LUFS`, `lfe=DB`.
+    // `loudness=LUFS`, `lfe=DB`, `binaural`.
     var audioShaping = AudioShaping()
     if let spec = takeStringFlag("--audio-shaping", from: &rest) {
         guard let parsed = parseAudioShapingSpec(spec) else {
-            print("ERROR: --audio-shaping takes off or ch=N,dialogue=DB,night,gain=DB,loudness=LUFS,lfe=DB; got '\(spec)'")
+            print("ERROR: --audio-shaping takes off or ch=N,dialogue=DB,night,gain=DB,loudness=LUFS,lfe=DB,binaural; got '\(spec)'")
             exit(64)
         }
         audioShaping = parsed
@@ -1157,9 +1175,14 @@ if first == "play" {
     // AE#956: LoadOptions.skipsContainerAttachments. Pair it with a throttled origin and an MKV that
     // carries fonts to see the open stop paying for them.
     let skipAttachments = takeFlag("--skip-attachments", from: &rest)
+    // AE#1129: LoadOptions.readsContainerAttachmentsAtOpen, the read at open the default moved behind
+    // the first frame. The FONTS line says when `fontAttachments` filled, against FIRSTFRAME.
+    let attachmentsAtOpen = takeFlag("--attachments-at-open", from: &rest)
     // AE#682: LoadOptions.serveIFramePlaylist on a full session, where the still ladder runs and
     // fills the rendition ahead of AVKit (`[StillLadder] reading through the I-frame rendition`).
     let playServesIFrames = takeFlag("--iframes", from: &rest)
+    // AE#1114: LoadOptions.recognizesBitmapSubtitleText; the cue log prints a TEXT line per read.
+    let playBitmapText = takeFlag("--bitmap-text", from: &rest)
     // #460: `--reload-applying <key>=<value>`, repeatable, with one shared delay. The delay is a
     // separate flag rather than teletext's `@ms` suffix because a header value can carry an `@`.
     // Default +20 s for the same reason the teletext switch uses it: the correction has to land on
@@ -1285,7 +1308,7 @@ if first == "play" {
         }
         done.wait()
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, liveJoinAtStart: liveJoinAtStart, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, liveReopenParameter: liveReopenParameter, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, liveJoinAtStart: liveJoinAtStart, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, liveReopenParameter: liveReopenParameter, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, seekAfter: seekAfter, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
@@ -1306,15 +1329,19 @@ if first == "play" {
                  assertDolbyVision: playAssertDV,
                  preserveASSMarkup: preserveASSMarkup,
                  skipAttachments: skipAttachments,
+                 attachmentsAtOpen: attachmentsAtOpen,
                  serveIFrames: playServesIFrames,
+                 bitmapText: playBitmapText,
                  dolbyVisionHandling: playDVHandling,
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
                  dualLayerRoute: playFelOutput ? .avPlayerOutput : .softwareHost,
                  upscalesLowResolutionVideo: playUpscale,
                  upscaleScaler: playLineArt ? .lineArt : .automatic,
+                 upscalesFullHDVideo: playUpscaleFullHD,
                  videoProcessing: playVideoProcessing,
                  attachSurface: playAttachSurface,
-                 record: playRecord))
+                 record: playRecord,
+                 readinessBudget: readinessBudget))
 }
 
 if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].contains(first) {
@@ -1367,6 +1394,13 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let customDvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let customReportsSize = takeFlag("--report-size", from: &rest)
     let customNoWrap = takeFlag("--no-wrap", from: &rest)
+    // AE#1117: the same spool as a closed recording instead of a live edge. The value is the
+    // declared duration; the load goes out VOD with sequentialOrigin, which is how a host that
+    // reads a finished HLS playlist itself hands it over.
+    let customVodSequential = takeDoubleFlag("--vod-sequential", from: &rest)
+    // AE#1117 round 2: a seek the host issues while the load is still in flight, which the engine
+    // stashes and replays once the session settles. Theamo seeks to 0 at every start and resume.
+    let customSeekDuringLoad = takeDoubleFlag("--seek-during-load", from: &rest)
     let customMallocCensus = takeFlag("--malloc-census", from: &rest)
     // AE#445 round 2: the reader arm is the measurement's subject, so it is a flag rather than a
     // fixed choice. Default reads with pread and allocates nothing, which is the reporter's shape
@@ -1484,7 +1518,9 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                                     carryTrim: customCarryTrim, reloadAt: customReloadAt,
                                     cancelLatches: customCancelLatches,
                                     reloadDecodePath: customReloadDecodePath,
-                                    axis: customReaderAxis, joinOffsetMB: customJoinOffsetMB))
+                                    axis: customReaderAxis, joinOffsetMB: customJoinOffsetMB,
+                                    vodDeclaredSeconds: customVodSequential,
+                                    seekDuringLoad: customSeekDuringLoad))
         }
         exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag, audioIndex: customAudioIndex, reloadDecodePath: customReloadDecodePath))
     default:

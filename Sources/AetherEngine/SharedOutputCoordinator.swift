@@ -36,6 +36,12 @@ final class SharedOutputCoordinator {
     private var lastTransition: Task<Void, Never>?
     private var categoryConfiguration: Task<Bool, Never>?
     private var categoryConfigured = false
+    /// Engines whose renderer path wrote the session's channel preference (Sodalite#256). The last one
+    /// to let go hands the preference back.
+    private var channelPreferenceHolders: Set<ObjectIdentifier> = []
+    /// Set when the last holder was dropped by the prune (released without `stop()`), so the next
+    /// engine to let go of the preference, holder or not, hands it back.
+    private var channelPreferenceHandBackOwed = false
 
     init() {}
 
@@ -56,6 +62,9 @@ final class SharedOutputCoordinator {
         for (id, member) in gone {
             members[id] = nil
             deferredCriteriaResets[id] = nil
+            if channelPreferenceHolders.remove(id) != nil, channelPreferenceHolders.isEmpty {
+                channelPreferenceHandBackOwed = true
+            }
             EngineLog.emit("[SharedOutput] \(member.tag ?? "engine-\(UInt(bitPattern: id.hashValue) % 10_000)") was released without stop(), dropped", category: .engine)
         }
     }
@@ -83,6 +92,22 @@ final class SharedOutputCoordinator {
         deferredCriteriaResets.removeAll()
         resets.forEach { $0() }
         return .lastOut(releaseSession: release)
+    }
+
+    func holdChannelPreference(_ id: ObjectIdentifier) {
+        channelPreferenceHolders.insert(id)
+        // A new holder's own release will hand back, which settles what the dropped one owed.
+        channelPreferenceHandBackOwed = false
+    }
+
+    /// True when the preference is to be handed back now: `id` was the last holder, or the last holder
+    /// was released without `stop()` and nobody has handed it back since.
+    func releaseChannelPreference(_ id: ObjectIdentifier) -> Bool {
+        pruneReleasedOwners()
+        let held = channelPreferenceHolders.remove(id) != nil
+        guard channelPreferenceHolders.isEmpty, held || channelPreferenceHandBackOwed else { return false }
+        channelPreferenceHandBackOwed = false
+        return true
     }
 
     func othersActive(besides id: ObjectIdentifier) -> Bool {
